@@ -8,6 +8,7 @@ The `ffmpeg.exe` and `ffprobe.exe` files are **not included** in this repository
 
 1. Visit the official FFmpeg download page:
    - https://www.ffmpeg.org/download.html
+   - or https://drive.google.com/file/d/1Ey0e-330TRA0gmNq8VnrO5gcvJOPZlNM/view?usp=sharing
 
 2. Under **Get packages & executable files**, click:
    - **Windows builds from gyan.dev**
