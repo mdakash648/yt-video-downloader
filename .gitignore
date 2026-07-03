@@ -1,0 +1,2 @@
+# Ignore all executable files inside ffmpeg folder
+ffmpeg/*.exe
