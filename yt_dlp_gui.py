@@ -25,6 +25,7 @@ Run:
 """
 
 import os
+import re
 import sys
 import json
 import threading
@@ -33,8 +34,18 @@ from tkinter import ttk, filedialog, messagebox
 
 try:
     import yt_dlp
+    from yt_dlp.utils import sanitize_filename
 except ImportError:
     yt_dlp = None
+    sanitize_filename = None
+
+# Matches youtube.com/watch, youtu.be, shorts, playlist and live links,
+# with or without scheme/www - used for clipboard auto-detect + paste.
+YOUTUBE_URL_RE = re.compile(
+    r'(https?://)?(www\.|m\.|music\.)?'
+    r'(youtube\.com/(watch\?v=|shorts/|playlist\?list=|live/)|youtu\.be/)[\w\-]+',
+    re.IGNORECASE
+)
 
 # Config file used to remember the last download location between sessions.
 # Stored in the user's home folder so it persists across app updates.
@@ -140,9 +151,18 @@ class YTDLPGui(tk.Tk):
 
         self.stop_flag = False
         self.worker_thread = None
+        self._retry_suffix = ""  # e.g. " (1)" when user chooses "Download Again"
+        self._last_clipboard = ""
 
         self._setup_styles()
         self._build_ui()
+
+        # Ctrl+R -> refresh the app (acts like a fresh restart)
+        self.bind_all("<Control-r>", self._on_refresh_shortcut)
+        self.bind_all("<Control-R>", self._on_refresh_shortcut)
+
+        # Watch the clipboard so a copied YouTube link auto-fills the URL box
+        self._start_clipboard_watcher()
 
         if yt_dlp is None:
             self._log("yt-dlp is not installed. Run: pip install yt-dlp")
@@ -306,17 +326,30 @@ class YTDLPGui(tk.Tk):
         # Header
         header = ttk.Frame(root, style="Main.TFrame")
         header.pack(fill="x", pady=(0, 14))
-        ttk.Label(header, text="⬇ YT-DLP Downloader", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Download videos, playlists, or audio from any supported site",
+        header_top = ttk.Frame(header, style="Main.TFrame")
+        header_top.pack(fill="x")
+        title_box = ttk.Frame(header_top, style="Main.TFrame")
+        title_box.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_box, text="⬇ YT-DLP Downloader", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(title_box, text="Download videos, playlists, or audio from any supported site",
                   style="SubHeader.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Button(header_top, text="🔄 Refresh  (Ctrl+R)", style="Ghost.TButton",
+                   command=self._refresh_app).pack(side="right", anchor="n")
 
         # URL card
         url_outer, url_inner = self._card(root, "Video / Playlist URL")
         url_outer.pack(fill="x", pady=(0, 12))
-        self.url_entry = ttk.Entry(url_inner, textvariable=self.url_var, style="TEntry")
-        self.url_entry.pack(fill="x", ipady=3)
+        url_row = ttk.Frame(url_inner, style="Card.TFrame")
+        url_row.pack(fill="x")
+        self.url_entry = ttk.Entry(url_row, textvariable=self.url_var, style="TEntry")
+        self.url_entry.pack(side="left", fill="x", expand=True, ipady=3)
         self.url_entry.bind("<FocusOut>", lambda e: self._maybe_autoload_titles())
         self.url_entry.bind("<Return>", lambda e: self._maybe_autoload_titles())
+        ttk.Button(url_row, text="📋 Paste", style="Ghost.TButton",
+                   command=self._paste_url).pack(side="left", padx=(10, 0))
+        ttk.Label(url_inner, text="YouTube লিংক কপি করলে এখানে automatically বসে যাবে, "
+                                   "অথবা Paste বাটনে ক্লিক করুন.",
+                  style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
 
         # Folder card
         folder_outer, folder_inner = self._card(root, "Download Location")
@@ -499,6 +532,107 @@ class YTDLPGui(tk.Tk):
 
     def _toggle_quality_state(self):
         self.quality_combo.config(state="disabled" if self.audio_only_var.get() else "readonly")
+
+    # ---------------- Clipboard auto-detect + Paste ----------------
+    @staticmethod
+    def _looks_like_youtube_url(text):
+        if not text:
+            return False
+        text = text.strip()
+        if not text or len(text) > 500 or "\n" in text:
+            return False
+        return bool(YOUTUBE_URL_RE.search(text))
+
+    def _paste_url(self):
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            text = ""
+        if not text:
+            messagebox.showinfo("Clipboard খালি", "ক্লিপবোর্ডে কোনো লেখা পাওয়া যায়নি।")
+            return
+        self.url_var.set(text)
+        self._last_clipboard = text
+        self._maybe_autoload_titles()
+
+    def _start_clipboard_watcher(self):
+        try:
+            self._last_clipboard = self.clipboard_get()
+        except tk.TclError:
+            self._last_clipboard = ""
+        self._poll_clipboard()
+
+    def _poll_clipboard(self):
+        try:
+            current = self.clipboard_get()
+        except tk.TclError:
+            current = ""
+        if current != self._last_clipboard:
+            self._last_clipboard = current
+            candidate = current.strip()
+            # Don't clobber the URL box while the user is actively typing/editing it.
+            focused_elsewhere = self.focus_get() is not self.url_entry
+            if (self._looks_like_youtube_url(candidate)
+                    and focused_elsewhere
+                    and candidate != self.url_var.get().strip()):
+                self.url_var.set(candidate)
+                self._log(f"Clipboard থেকে YouTube URL auto-paste হয়েছে: {candidate}")
+                self._maybe_autoload_titles()
+        # Keep polling every second for as long as the app is open.
+        self.after(1000, self._poll_clipboard)
+
+    # ---------------- Refresh (button + Ctrl+R) ----------------
+    def _on_refresh_shortcut(self, event=None):
+        self._refresh_app()
+        return "break"
+
+    def _refresh_app(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            if not messagebox.askyesno(
+                "Refresh",
+                "একটি ডাউনলোড চলছে। রিফ্রেশ করলে সেটি বন্ধ হয়ে যাবে। আপনি কি নিশ্চিত?"
+            ):
+                return
+            self.stop_flag = True
+
+        # Reset every field back to its startup default, like a fresh app open.
+        self.url_var.set("")
+        self.playlist_var.set(False)
+        self.select_all_var.set(True)
+        self.playlist_items_var.set("")
+        self.audio_only_var.set(False)
+        self.embed_thumbnail_var.set(True)
+        self.quality_var.set("Best available")
+        self.browser_var.set("None")
+        self._retry_suffix = ""
+
+        self.status_var.set("Idle")
+        self._reset_stats()
+        self.progress["value"] = 0
+
+        self._clear_titles_list()
+        self.titles_status_var.set(
+            "Tick 'Download entire playlist' and add a URL to load video titles here."
+        )
+        self.select_all_titles_btn.config(state="disabled")
+        self.deselect_all_titles_btn.config(state="disabled")
+
+        self.log_box.config(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.config(state="disabled")
+
+        self.download_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self._toggle_quality_state()
+        self._sync_playlist_controls()
+
+        self._log("App refreshed.")
+        if yt_dlp is None:
+            self._log("yt-dlp is not installed. Run: pip install yt-dlp")
+        if FFMPEG_DIR:
+            self._log(f"ffmpeg found: {FFMPEG_DIR}")
+        else:
+            self._log("ffmpeg not found (only needed for merging/MP3 conversion).")
 
     def _sync_playlist_controls(self):
         """Enable/disable the video-selection controls based on playlist + All-videos state."""
@@ -740,6 +874,7 @@ class YTDLPGui(tk.Tk):
         self._save_last_dir()
 
         self.stop_flag = False
+        self._retry_suffix = ""
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.progress["value"] = 0
@@ -752,10 +887,127 @@ class YTDLPGui(tk.Tk):
             else:
                 self._log(f"Playlist mode: downloading selected videos -> {self.playlist_items_var.get().strip()}")
 
-        self.worker_thread = threading.Thread(
-            target=self._run_download, args=(url, out_dir), daemon=True
-        )
+            # Duplicate-file checking is skipped in playlist mode (many titles at once).
+            self.worker_thread = threading.Thread(
+                target=self._run_download, args=(url, out_dir), daemon=True
+            )
+        else:
+            self.worker_thread = threading.Thread(
+                target=self._prepare_single_download, args=(url, out_dir), daemon=True
+            )
         self.worker_thread.start()
+
+    def _reset_download_buttons(self):
+        self.download_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+
+    def _fetch_title(self, url):
+        """Lightweight metadata fetch to learn the video's title before downloading."""
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            **self._cookies_opt(),
+            **self._ffmpeg_opt(),
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return (info or {}).get("title")
+
+    @staticmethod
+    def _find_existing_files(out_dir, base_name):
+        """Find files in out_dir matching base_name or 'base_name (n)', any extension."""
+        if not base_name or not os.path.isdir(out_dir):
+            return []
+        pattern = re.compile(r"^" + re.escape(base_name) + r"( \(\d+\))?$")
+        matches = []
+        for fname in os.listdir(out_dir):
+            name, _ext = os.path.splitext(fname)
+            if pattern.match(name):
+                matches.append(fname)
+        return matches
+
+    def _ask_duplicate_decision(self, existing_filename):
+        """Blocks the calling (worker) thread until the user answers the modal
+        shown on the main thread. Returns 'cancel' or 'again'."""
+        result = {"decision": "cancel"}
+        event = threading.Event()
+
+        def show_modal():
+            self._show_duplicate_modal(existing_filename, result, event)
+
+        self.after(0, show_modal)
+        event.wait()
+        return result["decision"]
+
+    def _show_duplicate_modal(self, existing_filename, result, event):
+        modal = tk.Toplevel(self)
+        modal.title("Already downloaded")
+        modal.configure(bg=BG_CARD)
+        modal.transient(self)
+        modal.resizable(False, False)
+
+        wrap = ttk.Frame(modal, style="Card.TFrame", padding=20)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="⚠ এই ভিডিওটি আগে থেকেই ডাউনলোড করা আছে",
+                  style="Body.TLabel", font=("Segoe UI Semibold", 11, "bold")
+                  ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(wrap, text=f"ফাইল: {existing_filename}", style="Subtle.TLabel",
+                  wraplength=380, justify="left").pack(anchor="w", pady=(0, 4))
+        ttk.Label(wrap, text="আবার ডাউনলোড করতে চান, নাকি বাতিল করবেন?",
+                  style="Subtle.TLabel", wraplength=380, justify="left").pack(anchor="w", pady=(0, 14))
+
+        btn_row = ttk.Frame(wrap, style="Card.TFrame")
+        btn_row.pack(fill="x")
+
+        def on_cancel():
+            result["decision"] = "cancel"
+            event.set()
+            modal.destroy()
+
+        def on_again():
+            result["decision"] = "again"
+            event.set()
+            modal.destroy()
+
+        ttk.Button(btn_row, text="Cancel", style="Stop.TButton", command=on_cancel).pack(side="left")
+        ttk.Button(btn_row, text="⬇ Download Again", style="Accent.TButton",
+                   command=on_again).pack(side="left", padx=(10, 0))
+        modal.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        modal.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - modal.winfo_height()) // 2
+        modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        modal.grab_set()
+
+    def _prepare_single_download(self, url, out_dir):
+        """Runs in a worker thread: fetch the title, check for an existing file
+        with the same name, ask the user if a duplicate is found, then download."""
+        title = None
+        if yt_dlp is not None and sanitize_filename is not None:
+            try:
+                self.status_var.set("Fetching video info...")
+                title = self._fetch_title(url)
+            except Exception as ex:
+                self._log(f"Could not pre-check title ({ex}); continuing without duplicate check.")
+
+        if title:
+            base_name = sanitize_filename(title) + self._quality_suffix()
+            existing = self._find_existing_files(out_dir, base_name)
+            if existing:
+                decision = self._ask_duplicate_decision(existing[0])
+                if decision == "cancel":
+                    self.status_var.set("Cancelled.")
+                    self._log("Download cancelled: video already exists.")
+                    self.after(0, self._reset_download_buttons)
+                    return
+                self._retry_suffix = f" ({len(existing)})"
+                self._log(f"Downloading again as: {base_name}{self._retry_suffix}")
+
+        self._run_download(url, out_dir)
 
     def _stop_download(self):
         self.stop_flag = True
@@ -835,11 +1087,26 @@ class YTDLPGui(tk.Tk):
             self.download_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
 
+    def _quality_suffix(self):
+        """Text appended to the end of the title for the selected quality,
+        e.g. ' 1080p'. Empty for 'Best available' and for audio-only mode."""
+        if self.audio_only_var.get():
+            return ""
+        quality = self.quality_var.get()
+        if quality and quality != "Best available":
+            return f" {quality}"
+        return ""
+
+    def _title_suffix(self):
+        """Quality suffix + retry marker (e.g. ' 1080p (1)'), used in the filename."""
+        return self._quality_suffix() + (self._retry_suffix or "")
+
     def _outtmpl(self, out_dir):
+        suffix = self._title_suffix()
         if self.playlist_var.get():
             # Numbers files in playlist order: "1. Title.ext", "2. Title.ext", ...
-            return os.path.join(out_dir, "%(playlist_index)s. %(title)s.%(ext)s")
-        return os.path.join(out_dir, "%(title)s.%(ext)s")
+            return os.path.join(out_dir, "%(playlist_index)s. %(title)s" + suffix + ".%(ext)s")
+        return os.path.join(out_dir, "%(title)s" + suffix + ".%(ext)s")
 
     def _download_video(self, url, out_dir):
         fmt = QUALITY_OPTIONS.get(self.quality_var.get(), "bestvideo[ext=mp4]+bestaudio/best/best")
