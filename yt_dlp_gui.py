@@ -10,6 +10,10 @@ Features:
 - Choose video quality (Best / 1080p / 720p / 480p / 360p)
 - Optional Audio only (MP3) mode
 - Live progress bar + percentage, download speed (KB/s or MB/s), ETA, log window, Stop button
+- Pause / Resume: pause a running download and resume it later from the same
+  point (via yt-dlp's continuedl range-resume) instead of starting over
+- Per-video playlist status icons: each title shows ⏳ pending / ⬇ downloading /
+  ✅ done / ❌ failed
 - Modern flat dark UI, fully scrollable on small screens
 - Remembers last used download folder automatically
 
@@ -152,11 +156,15 @@ class YTDLPGui(tk.Tk):
         self.playlist_progress_var = tk.StringVar(value="")
 
         self.stop_flag = False
+        self.pause_flag = False
         self.worker_thread = None
         self._retry_suffix = ""  # e.g. " (1)" when user chooses "Download Again"
         self._last_clipboard = ""
         self._loaded_titles = []  # [(idx, title), ...] from the most recent playlist load
         self._current_output_file = None  # final downloaded file path (for the "Play" button)
+        self._paused_context = None  # {"url":..., "out_dir":...} saved when paused, for Resume
+        self.video_status_vars = {}  # idx -> tk.StringVar() holding the status icon per playlist row
+        self._current_downloading_idx = None  # playlist index currently being downloaded (for pause/resume)
 
         self._setup_styles()
         self._build_ui()
@@ -459,6 +467,9 @@ class YTDLPGui(tk.Tk):
         self.download_btn = ttk.Button(btn_frame, text="⬇  Download", style="Accent.TButton",
                                         command=self._start_download)
         self.download_btn.pack(side="left")
+        self.pause_btn = ttk.Button(btn_frame, text="⏸  Pause", style="Ghost.TButton",
+                                     command=self._pause_download, state="disabled")
+        self.pause_btn.pack(side="left", padx=(10, 0))
         self.stop_btn = ttk.Button(btn_frame, text="■  Stop", style="Stop.TButton",
                                     command=self._stop_download, state="disabled")
         self.stop_btn.pack(side="left", padx=(10, 0))
@@ -614,6 +625,9 @@ class YTDLPGui(tk.Tk):
         self.browser_var.set("None")
         self._retry_suffix = ""
         self._loaded_titles = []
+        self.pause_flag = False
+        self._paused_context = None
+        self._current_downloading_idx = None
 
         self.status_var.set("Idle")
         self._reset_stats()
@@ -631,6 +645,7 @@ class YTDLPGui(tk.Tk):
         self.log_box.config(state="disabled")
 
         self.download_btn.config(state="normal")
+        self.pause_btn.config(text="⏸  Pause", command=self._pause_download, state="disabled", style="Ghost.TButton")
         self.stop_btn.config(state="disabled")
         self._toggle_quality_state()
         self._sync_playlist_controls()
@@ -709,6 +724,7 @@ class YTDLPGui(tk.Tk):
         self.titles_list_frame = ttk.Frame(parent, style="Card.TFrame")
         self.titles_list_frame.pack(fill="x", pady=(8, 0))
         self.video_check_vars = []
+        self.video_status_vars = {}
         self._sync_scrollregion()
 
     def _sync_scrollregion(self, reset_scroll=True):
@@ -810,25 +826,33 @@ class YTDLPGui(tk.Tk):
         if not self.select_all_var.get() and self.playlist_items_var.get().strip():
             manual_preselected = self._parse_playlist_items(self.playlist_items_var.get())
 
-        existing_keys = set()
         skipped_count = 0
-        if manual_preselected is None:
-            out_dir = self.download_dir.get().strip()
-            existing_keys = self._scan_existing_titles(out_dir)
+        out_dir = self.download_dir.get().strip()
+        existing_keys = self._scan_existing_titles(out_dir)
 
         for idx, title in titles:
+            is_duplicate = self._normalize_title_key(title) in existing_keys
             if manual_preselected is not None:
                 checked = idx in manual_preselected
             else:
-                is_duplicate = self._normalize_title_key(title) in existing_keys
                 checked = not is_duplicate
                 if is_duplicate:
                     skipped_count += 1
             var = tk.BooleanVar(value=checked)
-            cb = ttk.Checkbutton(self.titles_list_frame, text=f"{idx}. {title}",
+
+            row = ttk.Frame(self.titles_list_frame, style="Card.TFrame")
+            row.pack(fill="x", pady=1)
+
+            # Status icon: ⏳ pending / ⬇ downloading / ✅ done / ❌ failed
+            status_var = tk.StringVar(value="✅" if is_duplicate else "⏳")
+            ttk.Label(row, textvariable=status_var, style="Body.TLabel", width=2).pack(side="left")
+
+            cb = ttk.Checkbutton(row, text=f"{idx}. {title}",
                                   variable=var, command=self._on_title_check_changed)
-            cb.pack(anchor="w", pady=1)
+            cb.pack(side="left", anchor="w")
+
             self.video_check_vars.append((idx, var))
+            self.video_status_vars[idx] = status_var
 
         if manual_preselected is None and skipped_count:
             self.titles_status_var.set(
@@ -989,9 +1013,13 @@ class YTDLPGui(tk.Tk):
         self._save_last_dir()
 
         self.stop_flag = False
+        self.pause_flag = False
         self._retry_suffix = ""
         self._current_output_file = None
+        self._current_downloading_idx = None
+        self._paused_context = {"url": url, "out_dir": out_dir}
         self.download_btn.config(state="disabled")
+        self.pause_btn.config(text="⏸  Pause", command=self._pause_download, state="normal", style="Ghost.TButton")
         self.stop_btn.config(state="normal")
         self.progress["value"] = 0
         self._reset_stats()
@@ -1014,6 +1042,7 @@ class YTDLPGui(tk.Tk):
 
     def _reset_download_buttons(self):
         self.download_btn.config(state="normal")
+        self.pause_btn.config(text="⏸  Pause", command=self._pause_download, state="disabled", style="Ghost.TButton")
         self.stop_btn.config(state="disabled")
 
     def _fetch_title(self, url):
@@ -1335,6 +1364,21 @@ class YTDLPGui(tk.Tk):
         self._run_download(url, out_dir)
 
     def _stop_download(self):
+        if self.pause_flag and not (self.worker_thread and self.worker_thread.is_alive()):
+            # Fully cancelling from a paused state: no worker is running right
+            # now, so handle cleanup here instead of waiting for a hook.
+            out_dir = self._paused_context.get("out_dir") if self._paused_context else None
+            self.pause_flag = False
+            self._paused_context = None
+            self.status_var.set("Stopped.")
+            self._log("Paused download বাতিল করা হলো।")
+            self._cleanup_partial_files(out_dir)
+            self._reset_current_video_status_to_pending()
+            self.download_btn.config(state="normal")
+            self.pause_btn.config(text="⏸  Pause", command=self._pause_download, state="disabled", style="Ghost.TButton")
+            self.stop_btn.config(state="disabled")
+            return
+
         self.stop_flag = True
         self.status_var.set("Stopping...")
         self._log("Stop requested. It will halt after the current step.")
@@ -1342,11 +1386,22 @@ class YTDLPGui(tk.Tk):
     def _progress_hook(self, d):
         if self.stop_flag:
             raise yt_dlp.utils.DownloadError("Cancelled by user")
+        if self.pause_flag:
+            raise yt_dlp.utils.DownloadError("Paused by user")
 
         info = d.get("info_dict", {}) or {}
         pl_index = d.get("playlist_index") or info.get("playlist_index")
         pl_count = (d.get("playlist_count") or info.get("playlist_count")
                     or info.get("n_entries") or info.get("playlist_n_entries"))
+
+        if pl_index:
+            status_var = self.video_status_vars.get(pl_index)
+            if d["status"] == "downloading":
+                self._current_downloading_idx = pl_index
+                if status_var:
+                    status_var.set("⬇")
+            elif d["status"] == "finished" and status_var:
+                status_var.set("✅")
 
         if pl_index and pl_count:
             self.playlist_progress_var.set(f"{pl_index}/{pl_count}")
@@ -1406,6 +1461,8 @@ class YTDLPGui(tk.Tk):
 
             if self.stop_flag:
                 self._handle_stopped(out_dir)
+            elif self.pause_flag:
+                self._handle_paused()
             else:
                 self.status_var.set("Done!")
                 self.progress["value"] = 100
@@ -1413,6 +1470,7 @@ class YTDLPGui(tk.Tk):
                 self.speed_var.set("-- KB/s")
                 self.eta_var.set("ETA --:--")
                 self._log("Download completed successfully.")
+                self._finalize_playlist_statuses()
 
                 is_playlist = self.playlist_var.get()
                 output_file = self._current_output_file
@@ -1420,13 +1478,18 @@ class YTDLPGui(tk.Tk):
         except Exception as e:
             if self.stop_flag:
                 self._handle_stopped(out_dir)
+            elif self.pause_flag:
+                self._handle_paused()
             else:
                 self.status_var.set("Error occurred.")
                 self._log(f"Error: {e}")
+                self._finalize_playlist_statuses()
                 messagebox.showerror("Download error", str(e))
         finally:
-            self.download_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
+            if not self.pause_flag:
+                self.download_btn.config(state="normal")
+                self.pause_btn.config(text="⏸  Pause", command=self._pause_download, state="disabled", style="Ghost.TButton")
+                self.stop_btn.config(state="disabled")
 
     def _handle_stopped(self, out_dir):
         """Common handling for a user-initiated stop: update status/log, then
@@ -1434,6 +1497,89 @@ class YTDLPGui(tk.Tk):
         self.status_var.set("Stopped.")
         self._log("Download stopped by user.")
         self._cleanup_partial_files(out_dir)
+        self._reset_current_video_status_to_pending()
+
+    def _handle_paused(self):
+        """Common handling for a user-initiated pause: unlike Stop, this keeps
+        the partially-downloaded (.part) file on disk untouched so Resume can
+        continue it later via yt-dlp's range-request resume (continuedl,
+        which is on by default in yt-dlp)."""
+        self.status_var.set("Paused.")
+        self.speed_var.set("-- KB/s")
+        self.eta_var.set("ETA --:--")
+        self._log("⏸ Download paused. একই জায়গা থেকে আবার শুরু করতে 'Resume' বাটনে ক্লিক করুন।")
+        self._reset_current_video_status_to_pending()
+
+        self.download_btn.config(state="disabled")
+        self.pause_btn.config(text="▶  Resume", command=self._resume_download, state="normal", style="Accent.TButton")
+        self.stop_btn.config(state="normal")
+
+    def _reset_current_video_status_to_pending(self):
+        """When a playlist download is paused/stopped mid-file, put that
+        file's status icon back to pending so it doesn't look 'stuck'
+        downloading forever."""
+        idx = self._current_downloading_idx
+        if idx is not None:
+            status_var = self.video_status_vars.get(idx)
+            if status_var and status_var.get() != "✅":
+                status_var.set("⏳")
+        self._current_downloading_idx = None
+
+    def _selected_playlist_indices(self):
+        """Which playlist indices were actually meant to be downloaded in the
+        current run, used to know which status icons to finalize."""
+        if not self.playlist_var.get():
+            return None
+        if self.select_all_var.get():
+            if self.video_check_vars:
+                return {idx for idx, _var in self.video_check_vars}
+            return None
+        return self._parse_playlist_items(self.playlist_items_var.get())
+
+    def _finalize_playlist_statuses(self):
+        """After a playlist run finishes (successfully or with per-item
+        errors swallowed by ignoreerrors=True), any selected video that never
+        reached ✅ is marked ❌ failed."""
+        selected = self._selected_playlist_indices()
+        if not selected:
+            return
+        for idx in selected:
+            status_var = self.video_status_vars.get(idx)
+            if status_var and status_var.get() != "✅":
+                status_var.set("❌")
+
+    def _pause_download(self):
+        """Request a pause. The running yt-dlp download raises inside the
+        next progress-hook callback, which we catch in _run_download without
+        deleting the partial file, so Resume can continue it later."""
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        self.pause_flag = True
+        self.pause_btn.config(state="disabled")
+        self.status_var.set("Pausing...")
+        self._log("Pause requested. বর্তমান ফাইলের ডাউনলোড partial অবস্থায় রেখে থামানো হচ্ছে।")
+
+    def _resume_download(self):
+        """Restart the same download (same URL/folder/options). Already
+        finished files are detected and skipped by yt-dlp automatically, and
+        the in-progress file resumes from where it left off since we never
+        deleted its .part fragment."""
+        if not self._paused_context:
+            return
+        ctx = self._paused_context
+        self.pause_flag = False
+        self.stop_flag = False
+
+        self.download_btn.config(state="disabled")
+        self.pause_btn.config(text="⏸  Pause", command=self._pause_download, state="normal", style="Ghost.TButton")
+        self.stop_btn.config(state="normal")
+        self.status_var.set("Resuming...")
+        self._log("▶ Resume করা হচ্ছে — আগের জায়গা থেকে ডাউনলোড আবার শুরু হচ্ছে।")
+
+        self.worker_thread = threading.Thread(
+            target=self._run_download, args=(ctx["url"], ctx["out_dir"]), daemon=True
+        )
+        self.worker_thread.start()
 
     def _cleanup_partial_files(self, out_dir):
         """After a stopped download, remove half-downloaded fragments
@@ -1515,6 +1661,7 @@ class YTDLPGui(tk.Tk):
             "merge_output_format": "mp4",
             "postprocessors": thumb_postprocessors,
             "ignoreerrors": True,
+            "continuedl": True,  # resume partially-downloaded (.part) files instead of restarting
             "quiet": True,
             "no_warnings": True,
             **self._cookies_opt(),
@@ -1546,6 +1693,7 @@ class YTDLPGui(tk.Tk):
                 *thumb_postprocessors,
             ],
             "ignoreerrors": True,
+            "continuedl": True,  # resume partially-downloaded (.part) files instead of restarting
             "quiet": True,
             "no_warnings": True,
             **self._cookies_opt(),
