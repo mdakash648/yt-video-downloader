@@ -91,13 +91,51 @@ def find_bundled_ffmpeg():
 FFMPEG_DIR = find_bundled_ffmpeg()
 
 
-QUALITY_OPTIONS = {
-    "Best available": "bestvideo[ext=mp4]+bestaudio/best/best",
-    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]",
-}
+BEST_AVAILABLE_LABEL = "Best available"
+BEST_AVAILABLE_FORMAT = "bestvideo[ext=mp4]+bestaudio/best/best"
+
+# Shown in the quality dropdown before any real format data has been fetched
+# for the pasted URL (or if the fetch fails) -- replaced by the video's/
+# playlist's actual available resolutions as soon as they're detected.
+DEFAULT_QUALITY_LABELS = [BEST_AVAILABLE_LABEL, "1080p", "720p", "480p", "360p", "240p", "144p"]
+
+
+def height_label(height):
+    """Turn a raw pixel height into a dropdown label, e.g. 2160 -> '4K', 1080 -> '1080p'."""
+    if height >= 2160:
+        return "4K"
+    return f"{height}p"
+
+
+def label_to_height(label):
+    """Reverse of height_label -- turns a dropdown label back into a target
+    pixel height for the format selector. Returns a very large number for
+    'Best available' so every available height counts as a candidate."""
+    if label == BEST_AVAILABLE_LABEL:
+        return 999999
+    if label.upper() == "4K":
+        return 2160
+    digits = "".join(ch for ch in label if ch.isdigit())
+    return int(digits) if digits else 999999
+
+
+def build_format_selector(height):
+    """yt-dlp format selector capped at `height`, with an automatic fallback
+    to that video's lowest available quality (worst) when nothing is <=
+    height -- this is what makes 'download at least X but no lower than
+    whatever exists' work per-video across a whole playlist in one string,
+    since yt-dlp evaluates the selector separately for each video."""
+    return (f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+            f"/worstvideo+bestaudio/worst")
+
+
+def format_filesize(num_bytes):
+    """Human readable filesize, e.g. 512MB or 1.4GB. Returns '' for unknown."""
+    if not num_bytes or num_bytes <= 0:
+        return ""
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / 1024 ** 3:.2f} GB"
+    return f"{num_bytes / 1024 ** 2:.1f} MB"
 
 # ---------------- Color palette (modern dark theme) ----------------
 BG_MAIN = "#121417"
@@ -195,6 +233,16 @@ class YTDLPGui(tk.Tk):
         self._paused_context = None  # {"url":..., "out_dir":...} saved when paused, for Resume
         self.video_status_vars = {}  # idx -> tk.StringVar() holding the status icon per playlist row
         self._current_downloading_idx = None  # playlist index currently being downloaded (for pause/resume)
+
+        # ---- Dynamic format detection / size estimate state ----
+        self.video_size_vars = {}  # idx -> tk.StringVar() with per-video "720p · ≈120 MB" label
+        self._single_format_heights = {}   # {height:int -> filesize_bytes or None} for single-video mode
+        self._single_audio_size = None     # best audio-only track size (bytes) for single-video mode
+        self._playlist_format_heights = {}  # idx -> {height:int -> filesize_bytes or None}
+        self._playlist_audio_size = {}      # idx -> best audio-only track size (bytes)
+        self._format_fetch_generation = 0   # bumped on every new URL so stale background fetches self-cancel
+        self.estimated_size_var = tk.StringVar(value="")            # shown next to the Download button
+        self.estimated_size_progress_var = tk.StringVar(value="--")  # shown in the Progress card
 
         self._setup_styles()
         self._build_ui()
@@ -612,8 +660,8 @@ class YTDLPGui(tk.Tk):
         url_row.pack(fill="x")
         self.url_entry = ttk.Entry(url_row, textvariable=self.url_var, style="TEntry")
         self.url_entry.pack(side="left", fill="x", expand=True, ipady=3)
-        self.url_entry.bind("<FocusOut>", lambda e: self._maybe_autoload_titles())
-        self.url_entry.bind("<Return>", lambda e: self._maybe_autoload_titles())
+        self.url_entry.bind("<FocusOut>", lambda e: self._on_url_committed())
+        self.url_entry.bind("<Return>", lambda e: self._on_url_committed())
         ttk.Button(url_row, text="📋 Paste", style="Ghost.TButton",
                    command=self._paste_url).pack(side="left", padx=(10, 0))
         ttk.Label(self.single_url_frame, text="YouTube লিংক কপি করলে এখানে automatically বসে যাবে, "
@@ -704,10 +752,11 @@ class YTDLPGui(tk.Tk):
 
         ttk.Label(grid, text="Video quality", style="Subtle.TLabel").grid(row=0, column=0, sticky="w")
         self.quality_combo = ttk.Combobox(
-            grid, textvariable=self.quality_var, values=list(QUALITY_OPTIONS.keys()),
+            grid, textvariable=self.quality_var, values=DEFAULT_QUALITY_LABELS,
             state="readonly", width=18
         )
         self.quality_combo.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.quality_combo.bind("<<ComboboxSelected>>", self._on_quality_changed)
 
         ttk.Label(grid, text="Cookies from browser", style="Subtle.TLabel").grid(row=0, column=2, sticky="w", padx=(20, 0))
         self.browser_combo = ttk.Combobox(
@@ -780,6 +829,9 @@ class YTDLPGui(tk.Tk):
         self.stop_btn = ttk.Button(btn_frame, text="■  Stop", style="Stop.TButton",
                                     command=self._stop_download, state="disabled")
         self.stop_btn.pack(side="left", padx=(10, 0))
+        ttk.Label(btn_frame, textvariable=self.estimated_size_var, style="Subtle.TLabel").pack(
+            side="left", padx=(14, 0)
+        )
 
         # Progress card
         prog_outer, prog_inner = self._card(root, "Progress")
@@ -819,6 +871,12 @@ class YTDLPGui(tk.Tk):
         size_box.pack(side="left", padx=(30, 0))
         ttk.Label(size_box, text="📦 SIZE", style="Subtle.TLabel").pack(anchor="w")
         ttk.Label(size_box, textvariable=self.filesize_var, style="Stat.TLabel",
+                  background=BG_CARD).pack(anchor="w")
+
+        est_box = ttk.Frame(stats_row, style="Card.TFrame")
+        est_box.pack(side="left", padx=(30, 0))
+        ttk.Label(est_box, text="📥 EST. SIZE", style="Subtle.TLabel").pack(anchor="w")
+        ttk.Label(est_box, textvariable=self.estimated_size_progress_var, style="Stat.TLabel",
                   background=BG_CARD).pack(anchor="w")
 
         # Log card
@@ -868,6 +926,135 @@ class YTDLPGui(tk.Tk):
 
     def _toggle_quality_state(self):
         self.quality_combo.config(state="disabled" if self.audio_only_var.get() else "readonly")
+        self._recompute_estimated_size()
+
+    # ---------------- Dynamic quality dropdown + size estimate ----------------
+    def _update_quality_dropdown_values(self, heights_sorted_desc):
+        """Rebuild the quality dropdown from real detected heights (union of
+        all playlist videos, or just the one video's heights in single mode).
+        'Best available' is always kept as the first/default entry."""
+        labels = [BEST_AVAILABLE_LABEL]
+        seen = set()
+        for h in heights_sorted_desc:
+            lbl = height_label(h)
+            if lbl not in seen:
+                seen.add(lbl)
+                labels.append(lbl)
+        if not heights_sorted_desc:
+            labels = list(DEFAULT_QUALITY_LABELS)
+
+        current = self.quality_var.get()
+        self.quality_combo.config(values=labels)
+        if current not in labels:
+            self.quality_var.set(BEST_AVAILABLE_LABEL)
+
+    def _on_quality_changed(self, event=None):
+        for idx in self._playlist_format_heights.keys():
+            self._update_video_size_label(idx)
+        self._recompute_estimated_size()
+
+    def _selected_height_target(self):
+        """The pixel height the current quality selection maps to, for
+        building the format selector / size estimate. None means audio-only
+        (no video track needed)."""
+        if self.audio_only_var.get():
+            return None
+        return label_to_height(self.quality_var.get())
+
+    @staticmethod
+    def _estimate_for_heights(heights, audio_size, target_height):
+        """Given one video's {height: filesize} map, figure out which height
+        actually gets downloaded for `target_height` (best available <=
+        target, or that video's lowest/worst if nothing qualifies -- same
+        fallback the real format selector uses) and its approximate total
+        size in bytes. Returns (size_bytes_or_None, chosen_height_or_None)."""
+        if target_height is None:
+            return audio_size, None
+        if not heights:
+            return None, None
+        candidates = [h for h in heights if h <= target_height]
+        chosen_h = max(candidates) if candidates else min(heights)
+        size = heights.get(chosen_h)
+        if not size:
+            # This exact height has no known/estimated size (rare now that
+            # tbr*duration is used as a fallback, but still possible) --
+            # borrow the closest other height's size rather than showing
+            # nothing at all.
+            known = {h: s for h, s in heights.items() if s}
+            if known:
+                closest_h = min(known, key=lambda h: abs(h - chosen_h))
+                size = known[closest_h]
+        if size and audio_size:
+            size += audio_size  # approximate: covers the common DASH video+audio merge case
+        return size, chosen_h
+
+    def _selected_playlist_indices_for_estimate(self):
+        selected = self._selected_playlist_indices()
+        if selected is not None:
+            return selected
+        return set(self._playlist_format_heights.keys())
+
+    def _update_video_size_label(self, idx):
+        var = self.video_size_vars.get(idx)
+        if not var:
+            return
+        heights = self._playlist_format_heights.get(idx)
+        audio_size = self._playlist_audio_size.get(idx)
+        if not heights:
+            var.set("")
+            return
+        target = self._selected_height_target()
+        size, chosen_h = self._estimate_for_heights(heights, audio_size, target)
+        if not size:
+            var.set("")
+            return
+        label = height_label(chosen_h) if chosen_h else "audio"
+        var.set(f"{label} · ≈{format_filesize(size)}")
+
+    def _recompute_estimated_size(self):
+        """Recalculate the total estimated download size for the current
+        quality/audio-only selection, over whichever videos are actually
+        selected right now, and push it to both display spots (next to the
+        Download button, and the Progress card's Est. Size stat)."""
+        target = self._selected_height_target()
+        total_bytes = 0
+        any_known = False
+
+        if self.playlist_var.get():
+            for idx in self._selected_playlist_indices_for_estimate():
+                heights = self._playlist_format_heights.get(idx)
+                audio_size = self._playlist_audio_size.get(idx)
+                if not heights:
+                    continue
+                size, _h = self._estimate_for_heights(heights, audio_size, target)
+                if size:
+                    total_bytes += size
+                    any_known = True
+        else:
+            heights = self._single_format_heights
+            audio_size = self._single_audio_size
+            if heights:
+                size, _h = self._estimate_for_heights(heights, audio_size, target)
+                if size:
+                    total_bytes = size
+                    any_known = True
+
+        if any_known:
+            text = format_filesize(total_bytes)
+            self.estimated_size_var.set(f"Est. size: ≈{text}")
+            self.estimated_size_progress_var.set(f"≈{text}")
+        else:
+            self.estimated_size_var.set("")
+            self.estimated_size_progress_var.set("--")
+
+    def _selected_format_string(self):
+        """Build the actual yt-dlp format selector for the current quality
+        choice. Audio-only mode ignores this (uses bestaudio/best directly);
+        'Best available' uses the original unconstrained selector; anything
+        else gets the height-capped selector with a per-video worst fallback."""
+        if self.quality_var.get() == BEST_AVAILABLE_LABEL:
+            return BEST_AVAILABLE_FORMAT
+        return build_format_selector(self._selected_height_target())
 
     # ---------------- Clipboard auto-detect + Paste ----------------
     @staticmethod
@@ -889,7 +1076,7 @@ class YTDLPGui(tk.Tk):
             return
         self.url_var.set(text)
         self._last_clipboard = text
-        self._maybe_autoload_titles()
+        self._on_url_committed()
 
     # ---------------- Batch / multiple-URL mode ----------------
     def _on_batch_mode_toggle(self):
@@ -986,7 +1173,7 @@ class YTDLPGui(tk.Tk):
                     and candidate != self.url_var.get().strip()):
                 self.url_var.set(candidate)
                 self._log(f"Clipboard থেকে YouTube URL auto-paste হয়েছে: {candidate}")
-                self._maybe_autoload_titles()
+                self._on_url_committed()
         # Keep polling every second for as long as the app is open.
         self.after(1000, self._poll_clipboard)
 
@@ -1020,6 +1207,16 @@ class YTDLPGui(tk.Tk):
         self.pause_flag = False
         self._paused_context = None
         self._current_downloading_idx = None
+
+        self._format_fetch_generation += 1  # cancel any in-flight format probes
+        self._single_format_heights = {}
+        self._single_audio_size = None
+        self._playlist_format_heights = {}
+        self._playlist_audio_size = {}
+        self.video_size_vars = {}
+        self.estimated_size_var.set("")
+        self.estimated_size_progress_var.set("--")
+        self.quality_combo.config(values=DEFAULT_QUALITY_LABELS)
 
         self.batch_mode_var.set(False)
         self.batch_text.delete("1.0", "end")
@@ -1095,12 +1292,57 @@ class YTDLPGui(tk.Tk):
                 self.titles_status_var.set("Add a playlist URL, then click 'Load / Refresh Titles'.")
         else:
             self.titles_status_var.set("Tick 'Download entire playlist' and add a URL to load video titles here.")
+        self._maybe_autoload_formats()
 
     def _maybe_autoload_titles(self):
         if self.playlist_var.get():
             url = self.url_var.get().strip()
             if url:
                 self._load_playlist_titles(url)
+
+    def _on_url_committed(self):
+        """Called whenever the URL box gets a new value (typed + Enter/blur,
+        Paste button, or clipboard auto-fill). Kicks off both the existing
+        playlist-title load (if playlist mode is on) and the new real
+        format/resolution detection for the size preview + dynamic quality
+        dropdown."""
+        self._maybe_autoload_titles()
+        self._maybe_autoload_formats()
+
+    def _maybe_autoload_formats(self):
+        """Fetch the real available resolutions (and approximate sizes) for
+        whatever is in the URL box right now, in the background, and use them
+        to populate the quality dropdown + size estimate. Runs automatically
+        every time the URL changes."""
+        if yt_dlp is None:
+            return
+        url = self.url_var.get().strip()
+        if not url:
+            return
+
+        # Bump the generation counter so any still-running fetch for a
+        # previous URL notices it's stale and quietly gives up instead of
+        # overwriting the UI with old data.
+        self._format_fetch_generation += 1
+        gen = self._format_fetch_generation
+
+        self._single_format_heights = {}
+        self._single_audio_size = None
+        self._playlist_format_heights = {}
+        self._playlist_audio_size = {}
+        self.estimated_size_var.set("")
+        self.estimated_size_progress_var.set("--")
+
+        # Wipe the dropdown back to the generic placeholder list right away
+        # (instead of leaving the *previous* video's real resolutions sitting
+        # there) so a slow or failed fetch for the new URL never leaves a
+        # stale "4K" (or any other) option visible from the old video.
+        self._update_quality_dropdown_values([])
+
+        if self.playlist_var.get():
+            threading.Thread(target=self._fetch_playlist_formats_worker, args=(url, gen), daemon=True).start()
+        else:
+            threading.Thread(target=self._fetch_single_format_worker, args=(url, gen), daemon=True).start()
 
     def _manual_load_titles(self):
         if yt_dlp is None:
@@ -1125,6 +1367,7 @@ class YTDLPGui(tk.Tk):
         self.titles_list_frame.pack(fill="x", pady=(8, 0))
         self.video_check_vars = []
         self.video_status_vars = {}
+        self.video_size_vars = {}
         self._sync_scrollregion()
 
     def _sync_scrollregion(self, reset_scroll=True):
@@ -1155,7 +1398,155 @@ class YTDLPGui(tk.Tk):
         self._clear_titles_list()
         threading.Thread(target=self._fetch_playlist_titles_worker, args=(url,), daemon=True).start()
 
-    def _extract_playlist_titles(self, url, raise_on_error=False):
+    def _extract_format_heights(self, url):
+        """Full (non-flat) format probe for ONE video URL. Returns
+        (heights, audio_size):
+          heights: {height:int -> best known filesize in bytes, or None}
+          audio_size: best audio-only track's filesize in bytes, or None
+        Runs synchronously -- caller must invoke from a background thread."""
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            **self._cookies_opt(),
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        formats = (info or {}).get("formats") or []
+        duration = (info or {}).get("duration")  # seconds, used as a fallback size estimate
+
+        def _size_of(f):
+            """Real filesize if yt-dlp reports one; otherwise approximate it
+            from the format's bitrate * the video's duration -- YouTube
+            frequently omits filesize/filesize_approx on DASH formats, which
+            was leaving the size estimate blank almost every time."""
+            size = f.get("filesize") or f.get("filesize_approx")
+            if size:
+                return size
+            tbr = f.get("tbr") or f.get("vbr") or f.get("abr")
+            if tbr and duration:
+                return int(tbr * 1000 / 8 * duration)  # tbr is in kbps
+            return None
+
+        heights = {}
+        audio_size = None
+        for f in formats:
+            vcodec = f.get("vcodec")
+            acodec = f.get("acodec")
+            size = _size_of(f)
+            h = f.get("height")
+            if h and vcodec not in (None, "none"):
+                prev = heights.get(h)
+                if size:
+                    if prev is None or size > prev:
+                        heights[h] = size
+                elif h not in heights:
+                    heights[h] = None
+            elif vcodec in (None, "none") and acodec not in (None, "none"):
+                if size and (audio_size is None or size > audio_size):
+                    audio_size = size
+        return heights, audio_size
+
+    @staticmethod
+    def _entry_watch_url(entry):
+        """Build a playable video URL from a flat-extracted playlist entry."""
+        url = entry.get("url") or entry.get("webpage_url")
+        if url and str(url).startswith("http"):
+            return url
+        vid = entry.get("id")
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}"
+        return url
+
+    def _extract_playlist_entries(self, url):
+        """(idx, watch_url) pairs for every entry in a playlist -- a fast
+        flat listing, used to know which URLs to probe for real formats."""
+        opts = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            **self._cookies_opt(),
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        entries = (info or {}).get("entries") or []
+        result = []
+        for idx, entry in enumerate(entries, start=1):
+            if not entry:
+                continue
+            result.append((idx, self._entry_watch_url(entry)))
+        return result
+
+    def _fetch_single_format_worker(self, url, gen):
+        try:
+            heights, audio_size = self._extract_format_heights(url)
+        except Exception as ex:
+            if gen == self._format_fetch_generation:
+                self.after(0, lambda: self._log(f"Format তথ্য আনা যায়নি: {ex}"))
+                # Fetch failed for this URL -- make sure no stale resolution
+                # list from a *previous* URL is left showing.
+                self.after(0, lambda: self._update_quality_dropdown_values([]))
+            return
+        if gen != self._format_fetch_generation:
+            return
+        self.after(0, lambda: self._on_single_formats_loaded(heights, audio_size))
+
+    def _on_single_formats_loaded(self, heights, audio_size):
+        self._single_format_heights = heights
+        self._single_audio_size = audio_size
+        self._update_quality_dropdown_values(sorted(heights.keys(), reverse=True))
+        self._recompute_estimated_size()
+        if heights:
+            found = ", ".join(height_label(h) for h in sorted(heights, reverse=True))
+            self._log(f"Available resolutions detected: {found}")
+
+    def _fetch_playlist_formats_worker(self, url, gen):
+        try:
+            entries = self._extract_playlist_entries(url)
+        except Exception as ex:
+            if gen == self._format_fetch_generation:
+                self.after(0, lambda: self._log(f"Playlist format তথ্য আনা যায়নি: {ex}"))
+                self.after(0, lambda: self._update_quality_dropdown_values([]))
+            return
+        total = len(entries)
+        if not total:
+            return
+        if gen == self._format_fetch_generation:
+            self.after(0, lambda: self._log(
+                f"{total}টি ভিডিওর real resolution scan হচ্ছে (background এ) — বড় প্লেলিস্টে সময় লাগতে পারে।"
+            ))
+        for i, (idx, video_url) in enumerate(entries, start=1):
+            if gen != self._format_fetch_generation:
+                return
+            try:
+                heights, audio_size = self._extract_format_heights(video_url)
+            except Exception:
+                heights, audio_size = {}, None
+            if gen != self._format_fetch_generation:
+                return
+            self.after(0, lambda idx=idx, heights=heights, audio_size=audio_size, i=i, total=total:
+                       self._on_playlist_video_formats_loaded(idx, heights, audio_size, i, total))
+
+    def _on_playlist_video_formats_loaded(self, idx, heights, audio_size, i, total):
+        self._playlist_format_heights[idx] = heights
+        self._playlist_audio_size[idx] = audio_size
+
+        union = set()
+        for h_map in self._playlist_format_heights.values():
+            union.update(h_map.keys())
+        self._update_quality_dropdown_values(sorted(union, reverse=True))
+        self._update_video_size_label(idx)
+        self._recompute_estimated_size()
+
+        if i < total:
+            self.titles_status_var.set(f"Formats স্ক্যান হচ্ছে: {i}/{total} ভিডিও...")
+        else:
+            self.titles_status_var.set(f"{total} videos scanned — quality list ready.")
+            self._log("Playlist format scan complete.")
+
+
         """Fetch (idx, title) pairs for every entry in a playlist. Runs
         synchronously -- caller must invoke this from a worker thread.
         Returns [] on failure (or if raise_on_error=True, re-raises)."""
@@ -1251,8 +1642,15 @@ class YTDLPGui(tk.Tk):
                                   variable=var, command=self._on_title_check_changed)
             cb.pack(side="left", anchor="w")
 
+            size_var = tk.StringVar(value="")
+            ttk.Label(row, textvariable=size_var, style="Subtle.TLabel").pack(side="right", padx=(6, 0))
+
             self.video_check_vars.append((idx, var))
             self.video_status_vars[idx] = status_var
+            self.video_size_vars[idx] = size_var
+            self._update_video_size_label(idx)  # in case its formats were already scanned
+
+        self._recompute_estimated_size()
 
         if manual_preselected is None and skipped_count:
             self.titles_status_var.set(
@@ -1293,6 +1691,7 @@ class YTDLPGui(tk.Tk):
             self.playlist_items_var.set(self._compress_indices(selected))
 
         self._sync_playlist_controls()
+        self._recompute_estimated_size()
 
     @staticmethod
     def _compress_indices(indices):
@@ -2165,7 +2564,7 @@ class YTDLPGui(tk.Tk):
         return os.path.join(out_dir, "%(title)s" + suffix + ".%(ext)s")
 
     def _download_video(self, url, out_dir):
-        fmt = QUALITY_OPTIONS.get(self.quality_var.get(), "bestvideo[ext=mp4]+bestaudio/best/best")
+        fmt = self._selected_format_string()
         thumb_opts, thumb_postprocessors = self._thumbnail_opts()
 
         ydl_opts = {
