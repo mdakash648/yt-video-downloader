@@ -153,6 +153,7 @@ class YTDLPGui(tk.Tk):
         self.worker_thread = None
         self._retry_suffix = ""  # e.g. " (1)" when user chooses "Download Again"
         self._last_clipboard = ""
+        self._loaded_titles = []  # [(idx, title), ...] from the most recent playlist load
 
         self._setup_styles()
         self._build_ui()
@@ -605,6 +606,7 @@ class YTDLPGui(tk.Tk):
         self.quality_var.set("Best available")
         self.browser_var.set("None")
         self._retry_suffix = ""
+        self._loaded_titles = []
 
         self.status_var.set("Idle")
         self._reset_stats()
@@ -733,32 +735,68 @@ class YTDLPGui(tk.Tk):
 
     def _on_titles_loaded(self, titles, error):
         self.load_titles_btn.config(state="normal")
-        self._clear_titles_list()
 
         if error:
+            self._clear_titles_list()
             self.titles_status_var.set(error)
             self._log(error)
             return
         if not titles:
+            self._clear_titles_list()
             self.titles_status_var.set("No videos found in this playlist.")
             return
 
-        self.titles_status_var.set(f"{len(titles)} videos found — tick the ones you want, or use the text box above.")
+        self._loaded_titles = list(titles)
         self.select_all_titles_btn.config(state="normal")
         self.deselect_all_titles_btn.config(state="normal")
+        self._render_title_checkboxes(titles)
 
-        # Pre-check boxes based on any existing manual selection, otherwise check everything
-        preselected = None
+    def _render_title_checkboxes(self, titles):
+        """(Re)build the tick-box list for the given playlist titles.
+
+        Any manual selection already typed into the 'Or select videos' box is
+        respected first. Otherwise, videos whose title already matches a file
+        in the current download folder are auto-unchecked (skipped) so only
+        the missing/new videos stay ticked for download."""
+        self._clear_titles_list()
+
+        manual_preselected = None
         if not self.select_all_var.get() and self.playlist_items_var.get().strip():
-            preselected = self._parse_playlist_items(self.playlist_items_var.get())
+            manual_preselected = self._parse_playlist_items(self.playlist_items_var.get())
+
+        existing_keys = set()
+        skipped_count = 0
+        if manual_preselected is None:
+            out_dir = self.download_dir.get().strip()
+            existing_keys = self._scan_existing_titles(out_dir)
 
         for idx, title in titles:
-            checked = True if preselected is None else (idx in preselected)
+            if manual_preselected is not None:
+                checked = idx in manual_preselected
+            else:
+                is_duplicate = self._normalize_title_key(title) in existing_keys
+                checked = not is_duplicate
+                if is_duplicate:
+                    skipped_count += 1
             var = tk.BooleanVar(value=checked)
             cb = ttk.Checkbutton(self.titles_list_frame, text=f"{idx}. {title}",
                                   variable=var, command=self._on_title_check_changed)
             cb.pack(anchor="w", pady=1)
             self.video_check_vars.append((idx, var))
+
+        if manual_preselected is None and skipped_count:
+            self.titles_status_var.set(
+                f"{len(titles)} videos found — {skipped_count}টি folder-এ আগে থেকেই আছে (auto-skip), "
+                f"{len(titles) - skipped_count}টি ডাউনলোড হবে।"
+            )
+            self._log(f"Folder-এর সাথে title মিলিয়ে {skipped_count}টি ভিডিও auto-skip করা হয়েছে।")
+        else:
+            self.titles_status_var.set(
+                f"{len(titles)} videos found — tick the ones you want, or use the text box above."
+            )
+
+        # Sync select_all_var / playlist_items_var with whatever ended up checked above.
+        self._on_title_check_changed()
 
     def _set_all_title_checks(self, value):
         for _idx, var in self.video_check_vars:
@@ -827,11 +865,41 @@ class YTDLPGui(tk.Tk):
                     continue
         return result
 
+    @staticmethod
+    def _normalize_title_key(text):
+        """Collapse a title down to a bare comparable key so a playlist title
+        and an on-disk filename compare equal even if numbering, quality
+        suffixes, retry markers, or punctuation differ (e.g. a '/' in the
+        title vs the '⧸' character some filesystems/yt-dlp save it as)."""
+        text = (text or "").strip()
+        text = re.sub(r'^\d+[\.\-\)]\s*', '', text)  # leading "01. " / "01- " / "01) "
+        text = re.sub(r'\s+(1080p|720p|480p|360p)$', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+\(\d+\)$', '', text)  # trailing retry marker " (1)"
+        return re.sub(r'[^a-z0-9]+', '', text.lower())
+
+    @classmethod
+    def _scan_existing_titles(cls, out_dir):
+        """Return a set of normalized title-keys for every file already in
+        out_dir, used to auto-skip playlist videos already downloaded there."""
+        keys = set()
+        if not out_dir or not os.path.isdir(out_dir):
+            return keys
+        for fname in os.listdir(out_dir):
+            name, _ext = os.path.splitext(fname)
+            key = cls._normalize_title_key(name)
+            if key:
+                keys.add(key)
+        return keys
+
     def _choose_folder(self):
         folder = filedialog.askdirectory(initialdir=self.download_dir.get())
         if folder:
             self.download_dir.set(folder)
             self._save_last_dir()
+            # Folder changed: re-run the duplicate check against the new folder
+            # for any playlist titles that are already loaded.
+            if self._loaded_titles:
+                self._render_title_checkboxes(self._loaded_titles)
 
     def _log(self, msg):
         self.log_box.config(state="normal")
