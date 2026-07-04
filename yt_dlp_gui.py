@@ -7,6 +7,8 @@ Features:
 - Paste any YouTube (or yt-dlp supported site) URL
 - Choose download folder
 - Download single video OR full playlist
+- Batch mode: paste multiple URLs (one per line) into a textarea and queue
+  them all up to download one after another, with per-URL ⏳/⬇/✅/❌ status
 - Choose video quality (Best / 1080p / 720p / 480p / 360p)
 - Optional Audio only (MP3) mode
 - Live progress bar + percentage, download speed (KB/s or MB/s), ETA, log window, Stop button
@@ -154,6 +156,11 @@ class YTDLPGui(tk.Tk):
         self.eta_var = tk.StringVar(value="ETA --:--")
         self.filesize_var = tk.StringVar(value="")
         self.playlist_progress_var = tk.StringVar(value="")
+
+        # Batch / multiple-URL queue state
+        self.batch_mode_var = tk.BooleanVar(value=False)
+        self.batch_queue = []  # [{"url":..., "status_var": tk.StringVar()}, ...]
+        self._batch_current_index = None
 
         self.stop_flag = False
         self.pause_flag = False
@@ -351,7 +358,15 @@ class YTDLPGui(tk.Tk):
         # URL card
         url_outer, url_inner = self._card(root, "Video / Playlist URL")
         url_outer.pack(fill="x", pady=(0, 12))
-        url_row = ttk.Frame(url_inner, style="Card.TFrame")
+
+        ttk.Checkbutton(url_inner, text="🗂 Batch Mode: একসাথে একাধিক URL (এক লাইনে একটি করে)",
+                         variable=self.batch_mode_var,
+                         command=self._on_batch_mode_toggle).pack(anchor="w", pady=(0, 8))
+
+        # ---- Single URL mode (default) ----
+        self.single_url_frame = ttk.Frame(url_inner, style="Card.TFrame")
+        self.single_url_frame.pack(fill="x")
+        url_row = ttk.Frame(self.single_url_frame, style="Card.TFrame")
         url_row.pack(fill="x")
         self.url_entry = ttk.Entry(url_row, textvariable=self.url_var, style="TEntry")
         self.url_entry.pack(side="left", fill="x", expand=True, ipady=3)
@@ -359,9 +374,41 @@ class YTDLPGui(tk.Tk):
         self.url_entry.bind("<Return>", lambda e: self._maybe_autoload_titles())
         ttk.Button(url_row, text="📋 Paste", style="Ghost.TButton",
                    command=self._paste_url).pack(side="left", padx=(10, 0))
-        ttk.Label(url_inner, text="YouTube লিংক কপি করলে এখানে automatically বসে যাবে, "
+        ttk.Label(self.single_url_frame, text="YouTube লিংক কপি করলে এখানে automatically বসে যাবে, "
                                    "অথবা Paste বাটনে ক্লিক করুন.",
                   style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
+
+        # ---- Batch URL mode (multiple links, one per line) ----
+        self.batch_url_frame = ttk.Frame(url_inner, style="Card.TFrame")
+        # not packed by default; _on_batch_mode_toggle shows/hides this vs single_url_frame
+
+        batch_text_wrap = tk.Frame(self.batch_url_frame, bg=BG_INPUT,
+                                    highlightbackground=BORDER, highlightthickness=1)
+        batch_text_wrap.pack(fill="x")
+        self.batch_text = tk.Text(batch_text_wrap, height=6, wrap="none",
+                                   bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT,
+                                   bd=0, padx=10, pady=8, font=("Consolas", 9))
+        self.batch_text.pack(fill="both", expand=True)
+        self.batch_text.bind("<KeyRelease>", lambda e: self._update_batch_count())
+
+        batch_btn_row = ttk.Frame(self.batch_url_frame, style="Card.TFrame")
+        batch_btn_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(batch_btn_row, text="📋 Paste", style="Ghost.TButton",
+                   command=self._paste_batch_urls).pack(side="left")
+        ttk.Button(batch_btn_row, text="🧹 Clear", style="Ghost.TButton",
+                   command=self._clear_batch_urls).pack(side="left", padx=(8, 0))
+        self.batch_count_var = tk.StringVar(value="0 URL")
+        ttk.Label(batch_btn_row, textvariable=self.batch_count_var,
+                  style="Subtle.TLabel").pack(side="left", padx=(10, 0))
+
+        ttk.Label(self.batch_url_frame,
+                  text="প্রতি লাইনে একটি করে ভিডিও/প্লেলিস্ট লিংক পেস্ট করুন — সবগুলো একে একে (queue) "
+                       "ডাউনলোড হবে। '#' দিয়ে শুরু হওয়া লাইন উপেক্ষা করা হবে।",
+                  style="Subtle.TLabel", wraplength=640, justify="left").pack(anchor="w", pady=(6, 0))
+
+        # Live queue status list (rendered once a batch download starts)
+        self.batch_queue_frame = ttk.Frame(self.batch_url_frame, style="Card.TFrame")
+        self.batch_queue_frame.pack(fill="x", pady=(8, 0))
 
         # Folder card
         folder_outer, folder_inner = self._card(root, "Download Location")
@@ -573,6 +620,79 @@ class YTDLPGui(tk.Tk):
         self._last_clipboard = text
         self._maybe_autoload_titles()
 
+    # ---------------- Batch / multiple-URL mode ----------------
+    def _on_batch_mode_toggle(self):
+        """Switch the URL card between the single-URL entry and the
+        multi-line batch textarea."""
+        if self.batch_mode_var.get():
+            self.single_url_frame.pack_forget()
+            self.batch_url_frame.pack(fill="x")
+        else:
+            self.batch_url_frame.pack_forget()
+            self.single_url_frame.pack(fill="x")
+        self._sync_scrollregion()
+
+    def _parse_batch_urls(self):
+        """Read the batch textarea, one URL per line. Blank lines and lines
+        starting with '#' are ignored; duplicate lines are only queued once."""
+        raw = self.batch_text.get("1.0", "end")
+        urls = []
+        seen = set()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line not in seen:
+                seen.add(line)
+                urls.append(line)
+        return urls
+
+    def _update_batch_count(self):
+        count = len(self._parse_batch_urls())
+        self.batch_count_var.set(f"{count} URL" if count != 1 else "1 URL")
+
+    def _paste_batch_urls(self):
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            text = ""
+        if not text:
+            messagebox.showinfo("Clipboard খালি", "ক্লিপবোর্ডে কোনো লেখা পাওয়া যায়নি।")
+            return
+        current = self.batch_text.get("1.0", "end").strip()
+        if current:
+            self.batch_text.insert("end", "\n" + text)
+        else:
+            self.batch_text.insert("end", text)
+        self._update_batch_count()
+
+    def _clear_batch_urls(self):
+        self.batch_text.delete("1.0", "end")
+        self._update_batch_count()
+        self._clear_batch_queue_list()
+
+    def _clear_batch_queue_list(self):
+        parent = self.batch_queue_frame.master
+        self.batch_queue_frame.destroy()
+        self.batch_queue_frame = ttk.Frame(parent, style="Card.TFrame")
+        self.batch_queue_frame.pack(fill="x", pady=(8, 0))
+        self.batch_queue = []
+        self._sync_scrollregion()
+
+    def _render_batch_queue_list(self, urls):
+        """Build the pending/downloading/done/failed status rows for every
+        queued URL, shown live under the batch textarea while it downloads."""
+        self._clear_batch_queue_list()
+        for i, url in enumerate(urls, start=1):
+            row = ttk.Frame(self.batch_queue_frame, style="Card.TFrame")
+            row.pack(fill="x", pady=1)
+            status_var = tk.StringVar(value="⏳")
+            ttk.Label(row, textvariable=status_var, style="Body.TLabel", width=2).pack(side="left")
+            display = url if len(url) <= 70 else url[:67] + "..."
+            ttk.Label(row, text=f"{i}. {display}", style="Body.TLabel").pack(side="left", anchor="w")
+            self.batch_queue.append({"url": url, "status_var": status_var})
+        self._sync_scrollregion()
+
     def _start_clipboard_watcher(self):
         try:
             self._last_clipboard = self.clipboard_get()
@@ -628,6 +748,14 @@ class YTDLPGui(tk.Tk):
         self.pause_flag = False
         self._paused_context = None
         self._current_downloading_idx = None
+
+        self.batch_mode_var.set(False)
+        self.batch_text.delete("1.0", "end")
+        self._update_batch_count()
+        self._clear_batch_queue_list()
+        self.batch_url_frame.pack_forget()
+        self.single_url_frame.pack(fill="x")
+        self._batch_current_index = None
 
         self.status_var.set("Idle")
         self._reset_stats()
@@ -991,6 +1119,10 @@ class YTDLPGui(tk.Tk):
             messagebox.showerror("Missing dependency", "Please install yt-dlp first:\n\npip install yt-dlp")
             return
 
+        if self.batch_mode_var.get():
+            self._start_batch_download()
+            return
+
         url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("No URL", "Please paste a video or playlist URL.")
@@ -1039,6 +1171,118 @@ class YTDLPGui(tk.Tk):
                 target=self._prepare_single_download, args=(url, out_dir), daemon=True
             )
         self.worker_thread.start()
+
+    def _start_batch_download(self):
+        """Queue every URL pasted into the batch textarea and download them
+        one after another in a single worker thread."""
+        urls = self._parse_batch_urls()
+        if not urls:
+            messagebox.showwarning(
+                "No URL",
+                "একটি বা একাধিক URL পেস্ট করুন (প্রতি লাইনে একটি করে)।"
+            )
+            return
+
+        out_dir = self.download_dir.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No folder", "Please choose a download location.")
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+        self._save_last_dir()
+
+        self.stop_flag = False
+        self.pause_flag = False
+        self._retry_suffix = ""
+        self._current_output_file = None
+        self._paused_context = None
+
+        self._render_batch_queue_list(urls)
+
+        self.download_btn.config(state="disabled")
+        # Pause/Resume isn't supported for batch queues -- keep it disabled;
+        # Stop still works and cancels the rest of the queue.
+        self.pause_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.progress["value"] = 0
+        self._reset_stats()
+        self.status_var.set("Starting batch download...")
+        self._log(f"Batch download শুরু হচ্ছে — মোট {len(urls)}টি URL queue-তে আছে।")
+
+        self.worker_thread = threading.Thread(
+            target=self._run_batch_queue, args=(urls, out_dir), daemon=True
+        )
+        self.worker_thread.start()
+
+    def _run_batch_queue(self, urls, out_dir):
+        """Runs in a worker thread: download each queued URL one by one,
+        updating that row's status icon and the overall queue progress.
+        A failure on one URL doesn't stop the rest of the queue; Stop does."""
+        total = len(urls)
+        success_count = 0
+        fail_count = 0
+
+        for i, url in enumerate(urls, start=1):
+            if self.stop_flag:
+                break
+
+            self._batch_current_index = i
+            self.playlist_progress_var.set(f"{i}/{total}")
+            status_var = self.batch_queue[i - 1]["status_var"] if i - 1 < len(self.batch_queue) else None
+            if status_var:
+                status_var.set("⬇")
+
+            self._retry_suffix = ""
+            self._current_output_file = None
+            self.status_var.set(f"Downloading ({i}/{total})...")
+            self._log(f"[{i}/{total}] শুরু হচ্ছে: {url}")
+
+            try:
+                if self.audio_only_var.get():
+                    self._download_audio_only(url, out_dir)
+                else:
+                    self._download_video(url, out_dir)
+
+                if self.stop_flag:
+                    if status_var:
+                        status_var.set("⏳")
+                    self._log(f"[{i}/{total}] থামানো হয়েছে (user stop)।")
+                    break
+
+                if status_var:
+                    status_var.set("✅")
+                success_count += 1
+                self._log(f"[{i}/{total}] সম্পন্ন ✅")
+            except Exception as e:
+                if self.stop_flag:
+                    if status_var:
+                        status_var.set("⏳")
+                    self._log(f"[{i}/{total}] থামানো হয়েছে (user stop)।")
+                    break
+                if status_var:
+                    status_var.set("❌")
+                fail_count += 1
+                self._log(f"[{i}/{total}] ব্যর্থ ❌ — Error: {e}")
+
+        self._cleanup_partial_files(out_dir)
+        self._batch_current_index = None
+
+        if self.stop_flag:
+            self.status_var.set("Stopped.")
+            self._log("Batch download বন্ধ করা হয়েছে।")
+        else:
+            self.status_var.set("Batch finished!")
+            self.progress["value"] = 100
+            self.percent_var.set("100%")
+            self.speed_var.set("-- KB/s")
+            self.eta_var.set("ETA --:--")
+            self._log(f"Batch download শেষ — সফল: {success_count}, ব্যর্থ: {fail_count}, মোট: {total}")
+            self.after(0, lambda: messagebox.showinfo(
+                "Batch সম্পন্ন",
+                f"মোট {total}টি URL এর মধ্যে:\n✅ সফল: {success_count}\n❌ ব্যর্থ: {fail_count}"
+            ))
+
+        self.after(0, self._reset_download_buttons)
 
     def _reset_download_buttons(self):
         self.download_btn.config(state="normal")
