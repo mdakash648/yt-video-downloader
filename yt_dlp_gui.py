@@ -1134,8 +1134,7 @@ class YTDLPGui(tk.Tk):
                 self._download_video(url, out_dir)
 
             if self.stop_flag:
-                self.status_var.set("Stopped.")
-                self._log("Download stopped by user.")
+                self._handle_stopped(out_dir)
             else:
                 self.status_var.set("Done!")
                 self.progress["value"] = 100
@@ -1145,8 +1144,7 @@ class YTDLPGui(tk.Tk):
                 self._log("Download completed successfully.")
         except Exception as e:
             if self.stop_flag:
-                self.status_var.set("Stopped.")
-                self._log("Download stopped by user.")
+                self._handle_stopped(out_dir)
             else:
                 self.status_var.set("Error occurred.")
                 self._log(f"Error: {e}")
@@ -1154,6 +1152,59 @@ class YTDLPGui(tk.Tk):
         finally:
             self.download_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
+
+    def _handle_stopped(self, out_dir):
+        """Common handling for a user-initiated stop: update status/log, then
+        clean up leftover .part fragments and orphaned thumbnail files."""
+        self.status_var.set("Stopped.")
+        self._log("Download stopped by user.")
+        self._cleanup_partial_files(out_dir)
+
+    def _cleanup_partial_files(self, out_dir):
+        """After a stopped download, remove half-downloaded fragments
+        (*.part, *.ytdl) and orphaned thumbnail images (*.webp/.jpg/.jpeg/.png)
+        that belong to videos which never finished, so they don't clutter the
+        folder or confuse the title-matching/dedup check next time."""
+        if not out_dir or not os.path.isdir(out_dir):
+            return
+        thumb_exts = {".webp", ".jpg", ".jpeg", ".png"}
+        media_exts = {".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".opus", ".avi", ".mov"}
+        try:
+            entries = os.listdir(out_dir)
+        except OSError:
+            return
+
+        # A thumbnail is only "orphaned" if there's no genuinely finished
+        # media file with the same base name sitting next to it.
+        completed_bases = set()
+        for fname in entries:
+            base, ext = os.path.splitext(fname)
+            if ext.lower() in media_exts:
+                completed_bases.add(base)
+
+        deleted = []
+        for fname in entries:
+            full_path = os.path.join(out_dir, fname)
+            lower = fname.lower()
+            if lower.endswith(".part") or lower.endswith(".ytdl"):
+                try:
+                    os.remove(full_path)
+                    deleted.append(fname)
+                except OSError:
+                    pass
+                continue
+            base, ext = os.path.splitext(fname)
+            if ext.lower() in thumb_exts and base not in completed_bases:
+                try:
+                    os.remove(full_path)
+                    deleted.append(fname)
+                except OSError:
+                    pass
+
+        if deleted:
+            self._log(f"Cleanup: {len(deleted)}টি অসম্পূর্ণ ফাইল (.part / thumbnail) মুছে ফেলা হয়েছে —")
+            for f in deleted:
+                self._log(f"   ✕ {f}")
 
     def _quality_suffix(self):
         """Text appended to the end of the title for the selected quality,
