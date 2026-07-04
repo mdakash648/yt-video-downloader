@@ -42,6 +42,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 try:
+    import winsound  # Windows-only; used for the IDM-style completion beep
+except ImportError:
+    winsound = None
+
+try:
     import yt_dlp
     from yt_dlp.utils import sanitize_filename
 except ImportError:
@@ -2072,18 +2077,48 @@ class YTDLPGui(tk.Tk):
             messagebox.showerror("Error", f"ফাইলটি চালাতে সমস্যা হয়েছে:\n{ex}")
 
     # ---------------- Download-complete popup ----------------
+    @staticmethod
+    def _play_completion_sound():
+        """IDM-style alert beep when a download finishes. Uses the Windows
+        system notification sound where available; falls back to Tk's
+        cross-platform bell() everywhere else (or if winsound errors out for
+        any reason, e.g. no sound device)."""
+        if winsound is not None:
+            try:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                return
+            except Exception:
+                pass
+        try:
+            tk._default_root.bell()
+        except Exception:
+            pass
+
     def _show_completion_modal(self, is_playlist, output_file, out_dir):
         """Shown once a download finishes successfully.
 
         Playlist downloads: Close / Open Folder.
         Single video downloads: Close / Open Folder / Play.
         The app auto-refreshes as soon as the popup is closed.
+
+        IDM-style behaviour: this pops up centered on the *physical screen*
+        (not relative to the main window) and forces itself on top, so it
+        still shows up front and center even if the main app window is
+        minimized/in the taskbar -- the main window is deliberately left
+        minimized; only this small popup appears.
         """
+        self._play_completion_sound()
+
         modal = tk.Toplevel(self)
         modal.title("Download Complete")
         modal.configure(bg=BG_CARD)
-        modal.transient(self)
         modal.resizable(False, False)
+        # Intentionally NOT modal.transient(self): a transient window's
+        # visibility is tied to its owner on most platforms, so if the main
+        # window is minimized, a transient child gets hidden along with it.
+        # Keeping this as an independent toplevel lets it show up even while
+        # the main app stays minimized, exactly like IDM's popup.
+        modal.attributes("-topmost", True)
 
         wrap = ttk.Frame(modal, style="Card.TFrame", padding=20)
         wrap.pack(fill="both", expand=True)
@@ -2123,11 +2158,30 @@ class YTDLPGui(tk.Tk):
 
         modal.protocol("WM_DELETE_WINDOW", do_close)
 
+        # Center on the physical screen (horizontally AND vertically), not
+        # relative to the main window -- the main window's geometry can't be
+        # trusted while it's minimized, and IDM-style popups always appear
+        # dead-center on screen regardless of where the main app sits.
         modal.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - modal.winfo_height()) // 2
+        sw = modal.winfo_screenwidth()
+        sh = modal.winfo_screenheight()
+        mw = modal.winfo_width()
+        mh = modal.winfo_height()
+        x = (sw - mw) // 2
+        y = (sh - mh) // 2
         modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        # Force it to the front even though the main window may be
+        # minimized: deiconify (in case it somehow started iconified),
+        # lift above other windows, and grab keyboard focus.
+        modal.deiconify()
+        modal.lift()
+        modal.focus_force()
         modal.grab_set()
+        # Drop the always-on-top flag shortly after showing so it doesn't
+        # stay glued above every other window forever once the user is
+        # actively looking at it -- just needed it for the initial pop-up.
+        modal.after(500, lambda: modal.attributes("-topmost", False))
 
     def _prepare_playlist_download(self, url, out_dir):
         """Runs in a worker thread: figure out which of the *selected*
