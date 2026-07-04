@@ -139,6 +139,7 @@ class YTDLPGui(tk.Tk):
         self.playlist_var = tk.BooleanVar(value=False)
         self.select_all_var = tk.BooleanVar(value=True)
         self.playlist_items_var = tk.StringVar(value="")
+        self.playlist_numbering_var = tk.BooleanVar(value=True)
         self.audio_only_var = tk.BooleanVar(value=False)
         self.embed_thumbnail_var = tk.BooleanVar(value=True)
         self.quality_var = tk.StringVar(value="Best available")
@@ -389,6 +390,9 @@ class YTDLPGui(tk.Tk):
         ttk.Label(self.playlist_select_frame, text="e.g. 38  or  1,3,4,6  or  5-10,15",
                   style="Subtle.TLabel").pack(anchor="w", pady=(3, 0))
 
+        ttk.Checkbutton(self.playlist_select_frame, text="Number filenames (1. 2. 3. ...)",
+                         variable=self.playlist_numbering_var).pack(anchor="w", pady=(6, 0))
+
         ttk.Checkbutton(opt_inner, text="Audio only (save as MP3)",
                          variable=self.audio_only_var,
                          command=self._toggle_quality_state).pack(anchor="w", pady=(0, 6))
@@ -603,6 +607,7 @@ class YTDLPGui(tk.Tk):
         self.playlist_var.set(False)
         self.select_all_var.set(True)
         self.playlist_items_var.set("")
+        self.playlist_numbering_var.set(True)
         self.audio_only_var.set(False)
         self.embed_thumbnail_var.set(True)
         self.quality_var.set("Best available")
@@ -734,7 +739,10 @@ class YTDLPGui(tk.Tk):
         self._clear_titles_list()
         threading.Thread(target=self._fetch_playlist_titles_worker, args=(url,), daemon=True).start()
 
-    def _fetch_playlist_titles_worker(self, url):
+    def _extract_playlist_titles(self, url, raise_on_error=False):
+        """Fetch (idx, title) pairs for every entry in a playlist. Runs
+        synchronously -- caller must invoke this from a worker thread.
+        Returns [] on failure (or if raise_on_error=True, re-raises)."""
         try:
             opts = {
                 "extract_flat": True,
@@ -747,14 +755,25 @@ class YTDLPGui(tk.Tk):
                 info = ydl.extract_info(url, download=False)
             entries = (info or {}).get("entries")
             if not entries:
-                self.after(0, lambda: self._on_titles_loaded([], "This doesn't look like a playlist URL."))
-                return
+                return []
             titles = []
             for idx, entry in enumerate(entries, start=1):
                 if not entry:
                     continue
                 title = entry.get("title") or f"Video {idx}"
                 titles.append((idx, title))
+            return titles
+        except Exception:
+            if raise_on_error:
+                raise
+            return []
+
+    def _fetch_playlist_titles_worker(self, url):
+        try:
+            titles = self._extract_playlist_titles(url, raise_on_error=True)
+            if not titles:
+                self.after(0, lambda: self._on_titles_loaded([], "This doesn't look like a playlist URL."))
+                return
             self.after(0, lambda: self._on_titles_loaded(titles, None))
         except Exception as ex:
             err = str(ex)
@@ -984,9 +1003,8 @@ class YTDLPGui(tk.Tk):
             else:
                 self._log(f"Playlist mode: downloading selected videos -> {self.playlist_items_var.get().strip()}")
 
-            # Duplicate-file checking is skipped in playlist mode (many titles at once).
             self.worker_thread = threading.Thread(
-                target=self._run_download, args=(url, out_dir), daemon=True
+                target=self._prepare_playlist_download, args=(url, out_dir), daemon=True
             )
         else:
             self.worker_thread = threading.Thread(
@@ -1160,6 +1178,129 @@ class YTDLPGui(tk.Tk):
                        command=do_play).pack(side="left", padx=(10, 0))
 
         modal.protocol("WM_DELETE_WINDOW", do_close)
+
+        modal.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - modal.winfo_height()) // 2
+        modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        modal.grab_set()
+
+    def _prepare_playlist_download(self, url, out_dir):
+        """Runs in a worker thread: figure out which of the *selected*
+        playlist videos already exist in out_dir, and if any do, let the
+        user choose to skip them, download everything anyway, or cancel --
+        the same kind of protection single-video downloads already have."""
+        self.status_var.set("Checking for already-downloaded videos...")
+
+        titles = self._loaded_titles if self._loaded_titles else self._extract_playlist_titles(url)
+        if not titles:
+            self._log("Playlist duplicate-check skipped (couldn't read the playlist's video list).")
+            self._run_download(url, out_dir)
+            return
+
+        title_by_idx = dict(titles)
+
+        if self.select_all_var.get():
+            selected_indices = set(title_by_idx.keys())
+        else:
+            selected_indices = self._parse_playlist_items(self.playlist_items_var.get())
+            if not selected_indices:
+                self._run_download(url, out_dir)
+                return
+
+        # Rescan the folder fresh -- files may have been added since titles were loaded.
+        existing_keys = self._scan_existing_titles(out_dir)
+        duplicate_indices = sorted(
+            idx for idx in selected_indices
+            if idx in title_by_idx and self._normalize_title_key(title_by_idx[idx]) in existing_keys
+        )
+
+        if not duplicate_indices:
+            self._run_download(url, out_dir)
+            return
+
+        decision = self._ask_playlist_duplicate_decision(len(duplicate_indices), len(selected_indices))
+
+        if decision == "cancel":
+            self.status_var.set("Cancelled.")
+            self._log(f"Playlist download cancelled: {len(duplicate_indices)}টি ভিডিও আগে থেকেই ডাউনলোড করা আছে।")
+            self.after(0, self._reset_download_buttons)
+            return
+
+        if decision == "skip":
+            remaining = sorted(selected_indices - set(duplicate_indices))
+            if not remaining:
+                self.status_var.set("Cancelled.")
+                self._log("সিলেক্ট করা সব ভিডিও আগে থেকেই ডাউনলোড করা আছে — নতুন কিছু ডাউনলোড করার নেই।")
+                self.after(0, self._reset_download_buttons)
+                return
+            self.select_all_var.set(False)
+            self.playlist_items_var.set(self._compress_indices(remaining))
+            self._log(f"{len(duplicate_indices)}টি আগে থেকে থাকা ভিডিও স্কিপ করা হলো, "
+                      f"{len(remaining)}টি ডাউনলোড হবে।")
+        else:  # "again" -- download everything, including duplicates
+            self._log(f"{len(duplicate_indices)}টি ভিডিও আগে থেকেই আছে, তবুও সবগুলো আবার ডাউনলোড করা হচ্ছে।")
+
+        self._run_download(url, out_dir)
+
+    def _ask_playlist_duplicate_decision(self, duplicate_count, total_selected):
+        """Blocks the calling (worker) thread until the user answers the modal
+        shown on the main thread. Returns 'cancel', 'skip', or 'again'."""
+        result = {"decision": "cancel"}
+        event = threading.Event()
+
+        def show_modal():
+            self._show_playlist_duplicate_modal(duplicate_count, total_selected, result, event)
+
+        self.after(0, show_modal)
+        event.wait()
+        return result["decision"]
+
+    def _show_playlist_duplicate_modal(self, duplicate_count, total_selected, result, event):
+        modal = tk.Toplevel(self)
+        modal.title("Already downloaded")
+        modal.configure(bg=BG_CARD)
+        modal.transient(self)
+        modal.resizable(False, False)
+
+        wrap = ttk.Frame(modal, style="Card.TFrame", padding=20)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="⚠ কিছু ভিডিও আগে থেকেই ডাউনলোড করা আছে",
+                  style="Body.TLabel", font=("Segoe UI Semibold", 11, "bold")
+                  ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            wrap,
+            text=f"সিলেক্ট করা {total_selected}টি ভিডিওর মধ্যে {duplicate_count}টি ফোল্ডারে আগে থেকেই আছে।",
+            style="Subtle.TLabel", wraplength=380, justify="left"
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(wrap, text="আগে থেকে থাকা ভিডিওগুলো স্কিপ করবেন, নাকি সবগুলো আবার ডাউনলোড করবেন?",
+                  style="Subtle.TLabel", wraplength=380, justify="left").pack(anchor="w", pady=(0, 14))
+
+        btn_row = ttk.Frame(wrap, style="Card.TFrame")
+        btn_row.pack(fill="x")
+
+        def on_cancel():
+            result["decision"] = "cancel"
+            event.set()
+            modal.destroy()
+
+        def on_skip():
+            result["decision"] = "skip"
+            event.set()
+            modal.destroy()
+
+        def on_again():
+            result["decision"] = "again"
+            event.set()
+            modal.destroy()
+
+        ttk.Button(btn_row, text="Cancel", style="Stop.TButton", command=on_cancel).pack(side="left")
+        ttk.Button(btn_row, text="⏭ Skip Duplicates", style="Ghost.TButton",
+                   command=on_skip).pack(side="left", padx=(10, 0))
+        ttk.Button(btn_row, text="⬇ Download All Anyway", style="Accent.TButton",
+                   command=on_again).pack(side="left", padx=(10, 0))
+        modal.protocol("WM_DELETE_WINDOW", on_cancel)
 
         modal.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
@@ -1356,7 +1497,7 @@ class YTDLPGui(tk.Tk):
 
     def _outtmpl(self, out_dir):
         suffix = self._title_suffix()
-        if self.playlist_var.get():
+        if self.playlist_var.get() and self.playlist_numbering_var.get():
             # Numbers files in playlist order: "1. Title.ext", "2. Title.ext", ...
             return os.path.join(out_dir, "%(playlist_index)s. %(title)s" + suffix + ".%(ext)s")
         return os.path.join(out_dir, "%(title)s" + suffix + ".%(ext)s")
