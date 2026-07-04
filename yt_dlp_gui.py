@@ -122,6 +122,25 @@ def format_speed(bytes_per_sec):
     return f"{bytes_per_sec / 1024:.0f} KB/s"
 
 
+def parse_speed_limit(value_text, unit):
+    """Turn a plain number (e.g. '5') plus a unit ('KB/s' or 'MB/s') into raw
+    bytes/sec for yt-dlp's `ratelimit` option. Returns None if blank/invalid/zero
+    (meaning: no limit / unlimited speed)."""
+    if not value_text:
+        return None
+    value_text = value_text.strip()
+    if not value_text:
+        return None
+    try:
+        value = float(value_text)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    multiplier = 1024 * 1024 if unit == "MB/s" else 1024
+    return int(value * multiplier)
+
+
 def format_eta(seconds):
     if seconds is None:
         return "--:--"
@@ -152,6 +171,8 @@ class YTDLPGui(tk.Tk):
         self.embed_thumbnail_var = tk.BooleanVar(value=True)
         self.quality_var = tk.StringVar(value="Best available")
         self.browser_var = tk.StringVar(value="None")
+        self.speed_limit_value_var = tk.StringVar(value="")  # plain number, e.g. "5"
+        self.speed_limit_unit_var = tk.StringVar(value="MB/s")  # KB/s or MB/s
         self.status_var = tk.StringVar(value="Idle")
         self.percent_var = tk.StringVar(value="0%")
         self.speed_var = tk.StringVar(value="-- KB/s")
@@ -696,6 +717,24 @@ class YTDLPGui(tk.Tk):
         )
         self.browser_combo.grid(row=1, column=2, sticky="w", padx=(20, 0), pady=(4, 0))
 
+        ttk.Label(grid, text="Speed limit (throttle)", style="Subtle.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
+        speed_limit_row = ttk.Frame(grid, style="Card.TFrame")
+        speed_limit_row.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.speed_limit_entry = ttk.Entry(
+            speed_limit_row, textvariable=self.speed_limit_value_var, style="TEntry", width=8
+        )
+        self.speed_limit_entry.pack(side="left", ipady=2)
+        self.speed_limit_unit_combo = ttk.Combobox(
+            speed_limit_row, textvariable=self.speed_limit_unit_var,
+            values=["KB/s", "MB/s"], state="readonly", width=7
+        )
+        self.speed_limit_unit_combo.pack(side="left", padx=(6, 0))
+        ttk.Label(grid, text="e.g. 5 + MB/s — blank = unlimited", style="Subtle.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(3, 0)
+        )
+
         # Playlist Videos card - shows video titles so the user can tick which ones to grab.
         # This works alongside (not instead of) the manual "Or select videos" text entry above.
         pv_outer, pv_inner = self._card(root, "Playlist Videos")
@@ -803,6 +842,17 @@ class YTDLPGui(tk.Tk):
     def _ffmpeg_opt(self):
         if FFMPEG_DIR:
             return {"ffmpeg_location": FFMPEG_DIR}
+        return {}
+
+    def _ratelimit_opt(self):
+        """Throttle download speed to whatever the user set in the Speed
+        limit box (a plain number + KB/s or MB/s dropdown). yt-dlp's
+        `ratelimit` caps bytes/sec — e.g. if the connection could do 8MB/s
+        but the user sets 5 MB/s, yt-dlp automatically paces the download
+        down to ~5MB/s max (like --limit-rate 5M)."""
+        limit_bytes = parse_speed_limit(self.speed_limit_value_var.get(), self.speed_limit_unit_var.get())
+        if limit_bytes:
+            return {"ratelimit": limit_bytes}
         return {}
 
     def _thumbnail_opts(self):
@@ -964,6 +1014,7 @@ class YTDLPGui(tk.Tk):
         self.embed_thumbnail_var.set(True)
         self.quality_var.set("Best available")
         self.browser_var.set("None")
+        self.speed_limit_value_var.set("")
         self._retry_suffix = ""
         self._loaded_titles = []
         self.pause_flag = False
@@ -2132,10 +2183,14 @@ class YTDLPGui(tk.Tk):
             **self._cookies_opt(),
             **self._playlist_items_opt(),
             **self._ffmpeg_opt(),
+            **self._ratelimit_opt(),
             **thumb_opts,
         }
 
         self._log(f"Format selector: {fmt}")
+        limit_bytes = parse_speed_limit(self.speed_limit_value_var.get(), self.speed_limit_unit_var.get())
+        if limit_bytes:
+            self._log(f"Speed limit active: max {format_speed(limit_bytes)} (throttled).")
         if self.embed_thumbnail_var.get():
             self._log("Embedding video thumbnail as poster/cover art.")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2164,8 +2219,12 @@ class YTDLPGui(tk.Tk):
             **self._cookies_opt(),
             **self._playlist_items_opt(),
             **self._ffmpeg_opt(),
+            **self._ratelimit_opt(),
             **thumb_opts,
         }
+        limit_bytes = parse_speed_limit(self.speed_limit_value_var.get(), self.speed_limit_unit_var.get())
+        if limit_bytes:
+            self._log(f"Speed limit active: max {format_speed(limit_bytes)} (throttled).")
         if self.embed_thumbnail_var.get():
             self._log("Embedding video thumbnail as MP3 cover art.")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
