@@ -36,6 +36,8 @@ import sys
 import json
 import subprocess
 import threading
+import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -196,6 +198,10 @@ class YTDLPGui(tk.Tk):
             self._log("ffmpeg not found (only needed for merging/MP3 conversion; "
                        "packaged .exe builds bundle it automatically).")
 
+        # Auto-check for a newer yt-dlp version shortly after opening (quiet
+        # unless an update is actually available -- see _check_ytdlp_update).
+        self.after(1500, lambda: self._check_ytdlp_update(manual=False))
+
     # ---------------- Config persistence ----------------
     def _load_last_dir(self, fallback):
         try:
@@ -214,6 +220,218 @@ class YTDLPGui(tk.Tk):
                 json.dump({"last_download_dir": self.download_dir.get().strip()}, f)
         except OSError:
             pass
+
+    # ---------------- yt-dlp self-update check ----------------
+    @staticmethod
+    def _installed_ytdlp_version():
+        if yt_dlp is None:
+            return None
+        try:
+            from yt_dlp.version import __version__ as v
+            return v
+        except Exception:
+            return getattr(yt_dlp, "__version__", None)
+
+    def _check_ytdlp_update(self, manual=False):
+        """Check PyPI for a newer yt-dlp release. Silent on the automatic
+        startup check unless an update is actually found; manual checks
+        (via the header button) always report back to the user."""
+        if yt_dlp is None:
+            if manual:
+                messagebox.showerror("Missing dependency",
+                                      "yt-dlp ইনস্টল করা নেই।\n\npip install yt-dlp চালান।")
+            return
+        if manual:
+            self.update_check_btn.config(state="disabled", text="🔄 Checking...")
+        threading.Thread(target=self._check_ytdlp_update_worker, args=(manual,), daemon=True).start()
+
+    def _check_ytdlp_update_worker(self, manual):
+        current = self._installed_ytdlp_version() or "unknown"
+        try:
+            req = urllib.request.Request(
+                "https://pypi.org/pypi/yt-dlp/json",
+                headers={"User-Agent": "yt-dlp-gui-update-checker"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            latest = (data.get("info", {}) or {}).get("version")
+        except Exception as ex:
+            self.after(0, lambda: self._on_update_check_result(current, None, manual, str(ex)))
+            return
+        self.after(0, lambda: self._on_update_check_result(current, latest, manual, None))
+
+    @staticmethod
+    def _version_tuple(v):
+        """Turn a version string into a tuple of ints for correct numeric
+        comparison, e.g. '2026.6.9' and '2026.06.09' both become
+        (2026, 6, 9) -- a plain string compare would wrongly treat
+        '2026.6.9' as "newer" than '2026.06.09' since '6' > '0'."""
+        return tuple(int(p) for p in re.findall(r'\d+', v or ""))
+
+    def _on_update_check_result(self, current, latest, manual, error):
+        if manual:
+            self.update_check_btn.config(state="normal", text="⬆ yt-dlp Update Check")
+
+        if error:
+            self._log(f"yt-dlp update check ব্যর্থ: {error}")
+            if manual:
+                messagebox.showwarning("Update check ব্যর্থ",
+                                        f"লেটেস্ট ভার্সন চেক করা যায়নি (ইন্টারনেট কানেকশন চেক করুন)।\n\n{error}")
+            return
+
+        if not latest:
+            self._log("yt-dlp update check: PyPI থেকে ভার্সন তথ্য পাওয়া যায়নি।")
+            return
+
+        try:
+            is_newer = (current != "unknown"
+                        and self._version_tuple(latest) > self._version_tuple(current))
+        except Exception:
+            # Fallback for any version string that doesn't parse as expected.
+            is_newer = current != "unknown" and latest != current
+
+        if is_newer:
+            self._log(f"yt-dlp নতুন ভার্সন পাওয়া গেছে: {latest} (আপনার আছে: {current})")
+            self._show_ytdlp_update_modal(current, latest)
+        else:
+            self._log(f"yt-dlp আপ-টু-ডেট আছে (version {current}).")
+            if manual:
+                self._show_ytdlp_uptodate_modal(current)
+
+    def _show_ytdlp_uptodate_modal(self, current):
+        """Shown only for a manual check when no update is available --
+        just an info notice with a single Close button."""
+        modal = tk.Toplevel(self)
+        modal.title("yt-dlp")
+        modal.configure(bg=BG_CARD)
+        modal.transient(self)
+        modal.resizable(False, False)
+
+        wrap = ttk.Frame(modal, style="Card.TFrame", padding=20)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="✅ তোমার yt-dlp আপডেট আছে",
+                  style="Body.TLabel", font=("Segoe UI Semibold", 11, "bold")
+                  ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            wrap, text=f"বর্তমান ভার্সন: {current}\nএটাই সর্বশেষ ভার্সন — নতুন কিছু নেই।",
+            style="Subtle.TLabel", wraplength=380, justify="left"
+        ).pack(anchor="w", pady=(0, 14))
+
+        ttk.Button(wrap, text="Close", style="Stop.TButton",
+                   command=modal.destroy).pack(anchor="w")
+
+        modal.protocol("WM_DELETE_WINDOW", modal.destroy)
+        modal.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - modal.winfo_height()) // 2
+        modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        modal.grab_set()
+
+    def _show_ytdlp_update_modal(self, current, latest):
+        modal = tk.Toplevel(self)
+        modal.title("yt-dlp Update Available")
+        modal.configure(bg=BG_CARD)
+        modal.transient(self)
+        modal.resizable(False, False)
+
+        wrap = ttk.Frame(modal, style="Card.TFrame", padding=20)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="⬆ নতুন yt-dlp ভার্সন পাওয়া গেছে",
+                  style="Body.TLabel", font=("Segoe UI Semibold", 11, "bold")
+                  ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            wrap,
+            text=f"আপনার বর্তমান ভার্সন: {current}\nনতুন ভার্সন: {latest}",
+            style="Subtle.TLabel", wraplength=380, justify="left"
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            wrap,
+            text="YouTube মাঝেমধ্যে তাদের সাইট পরিবর্তন করে, যার কারণে পুরনো yt-dlp ভার্সনে "
+                 "ডাউনলোড ফেইল করতে পারে। আপডেট করে নেওয়াই ভালো।",
+            style="Subtle.TLabel", wraplength=380, justify="left"
+        ).pack(anchor="w", pady=(0, 14))
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(wrap, textvariable=status_var, style="Subtle.TLabel",
+                  wraplength=380, justify="left").pack(anchor="w", pady=(0, 10))
+
+        btn_row = ttk.Frame(wrap, style="Card.TFrame")
+        btn_row.pack(fill="x")
+
+        close_btn = ttk.Button(btn_row, text="Close", style="Stop.TButton", command=modal.destroy)
+        close_btn.pack(side="left")
+
+        update_btn = ttk.Button(btn_row, text="🔄 Update Now", style="Accent.TButton")
+        update_btn.pack(side="left", padx=(10, 0))
+
+        def do_update():
+            update_btn.config(state="disabled", text="Updating...")
+            close_btn.config(state="disabled")
+            status_var.set("pip install --upgrade yt-dlp চলছে... একটু অপেক্ষা করুন।")
+            threading.Thread(
+                target=self._run_ytdlp_update,
+                args=(status_var, update_btn, close_btn),
+                daemon=True
+            ).start()
+
+        update_btn.config(command=do_update)
+        modal.protocol("WM_DELETE_WINDOW", modal.destroy)
+
+        modal.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - modal.winfo_height()) // 2
+        modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        modal.grab_set()
+
+    def _run_ytdlp_update(self, status_var, update_btn, close_btn):
+        """Runs in a worker thread: pip install --upgrade yt-dlp, with an
+        automatic retry using --break-system-packages if pip refuses on an
+        externally-managed Python (common on modern Linux distros)."""
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            output = (result.stdout or "") + (result.stderr or "")
+            ok = result.returncode == 0
+            if not ok and "externally-managed-environment" in output:
+                result2 = subprocess.run(cmd + ["--break-system-packages"], capture_output=True, text=True)
+                output += "\n--- retry with --break-system-packages ---\n"
+                output += (result2.stdout or "") + (result2.stderr or "")
+                ok = result2.returncode == 0
+        except Exception as ex:
+            output = str(ex)
+            ok = False
+
+        self.after(0, lambda: self._on_ytdlp_update_done(ok, output, status_var, update_btn, close_btn))
+
+    def _on_ytdlp_update_done(self, ok, output, status_var, update_btn, close_btn):
+        for line in output.strip().splitlines()[-15:]:
+            self._log(f"[pip] {line}")
+
+        if not ok:
+            status_var.set("❌ আপডেট ব্যর্থ হয়েছে। Log-এ বিস্তারিত দেখুন।")
+            update_btn.config(state="normal", text="🔄 Retry Update")
+            close_btn.config(state="normal")
+            return
+
+        status_var.set("✅ আপডেট সম্পন্ন! পরিবর্তন কার্যকর করতে অ্যাপ Restart করুন।")
+        close_btn.config(state="normal", text="পরে করব")
+        update_btn.config(text="🔁 Restart Now", state="normal", command=self._restart_app_for_update)
+        self._log("yt-dlp সফলভাবে আপডেট হয়েছে। পরিবর্তন কার্যকর করতে অ্যাপ restart করুন।")
+
+    def _restart_app_for_update(self):
+        python = sys.executable
+        try:
+            if getattr(sys, "frozen", False):
+                os.execv(python, [python] + sys.argv[1:])
+            else:
+                os.execv(python, [python] + sys.argv)
+        except Exception as ex:
+            messagebox.showerror(
+                "Restart ব্যর্থ",
+                f"অ্যাপ automatically restart করা যায়নি। ম্যানুয়ালি বন্ধ করে আবার চালু করুন।\n\n{ex}"
+            )
 
     # ---------------- Styling ----------------
     def _setup_styles(self):
@@ -354,6 +572,9 @@ class YTDLPGui(tk.Tk):
                   style="SubHeader.TLabel").pack(anchor="w", pady=(2, 0))
         ttk.Button(header_top, text="🔄 Refresh  (Ctrl+R)", style="Ghost.TButton",
                    command=self._refresh_app).pack(side="right", anchor="n")
+        self.update_check_btn = ttk.Button(header_top, text="⬆ yt-dlp Update Check", style="Ghost.TButton",
+                                            command=lambda: self._check_ytdlp_update(manual=True))
+        self.update_check_btn.pack(side="right", anchor="n", padx=(0, 8))
 
         # URL card
         url_outer, url_inner = self._card(root, "Video / Playlist URL")
