@@ -53,7 +53,7 @@ if exist icon.ico (
 echo.
 echo === Step 3: Build the .exe with PyInstaller ===
 pyinstaller --noconfirm --onefile --windowed ^
-    --name "yt video downloader" ^
+    --name "YTDLPDownloader" ^
     %ICON_FLAG% ^
     --add-binary "ffmpeg\ffmpeg.exe;ffmpeg" ^
     --add-binary "ffmpeg\ffprobe.exe;ffmpeg" ^
