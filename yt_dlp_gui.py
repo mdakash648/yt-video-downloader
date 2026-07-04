@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import json
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -154,6 +155,7 @@ class YTDLPGui(tk.Tk):
         self._retry_suffix = ""  # e.g. " (1)" when user chooses "Download Again"
         self._last_clipboard = ""
         self._loaded_titles = []  # [(idx, title), ...] from the most recent playlist load
+        self._current_output_file = None  # final downloaded file path (for the "Play" button)
 
         self._setup_styles()
         self._build_ui()
@@ -627,6 +629,7 @@ class YTDLPGui(tk.Tk):
         self.stop_btn.config(state="disabled")
         self._toggle_quality_state()
         self._sync_playlist_controls()
+        self._sync_scrollregion()
 
         self._log("App refreshed.")
         if yt_dlp is None:
@@ -693,9 +696,33 @@ class YTDLPGui(tk.Tk):
         self._load_playlist_titles(url)
 
     def _clear_titles_list(self):
-        for child in self.titles_list_frame.winfo_children():
-            child.destroy()
+        # Destroying children alone can leave ttk's cached geometry pointing
+        # at the old (larger) size, so the frame doesn't visually shrink.
+        # Recreating the frame from scratch forces a clean recalculation.
+        parent = self.titles_list_frame.master
+        self.titles_list_frame.destroy()
+        self.titles_list_frame = ttk.Frame(parent, style="Card.TFrame")
+        self.titles_list_frame.pack(fill="x", pady=(8, 0))
         self.video_check_vars = []
+        self._sync_scrollregion()
+
+    def _sync_scrollregion(self, reset_scroll=True):
+        """Force Tk to recompute geometry right now (not on the next idle
+        tick) and refresh the canvas scrollregion. Without this, destroying
+        widgets (e.g. clearing the playlist title checkboxes) leaves the
+        'Playlist Videos' card showing its old, larger height until some
+        unrelated event happens to trigger a redraw.
+
+        Also resets the scroll position back to the top by default. This
+        matters because if the user had scrolled down while a long title
+        list was showing, and that list then shrinks/empties, the canvas
+        keeps its old scroll offset and ends up pointed at blank space below
+        the now-smaller content -- looking exactly like the section never
+        shrank at all, even though it did."""
+        self.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        if reset_scroll:
+            self.canvas.yview_moveto(0.0)
 
     def _load_playlist_titles(self, url):
         if yt_dlp is None:
@@ -797,6 +824,7 @@ class YTDLPGui(tk.Tk):
 
         # Sync select_all_var / playlist_items_var with whatever ended up checked above.
         self._on_title_check_changed()
+        self._sync_scrollregion()
 
     def _set_all_title_checks(self, value):
         for _idx, var in self.video_check_vars:
@@ -943,6 +971,7 @@ class YTDLPGui(tk.Tk):
 
         self.stop_flag = False
         self._retry_suffix = ""
+        self._current_output_file = None
         self.download_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.progress["value"] = 0
@@ -1051,6 +1080,93 @@ class YTDLPGui(tk.Tk):
         modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         modal.grab_set()
 
+    # ---------------- Open folder / play file (OS default apps) ----------------
+    def _open_folder(self, folder):
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("ফোল্ডার পাওয়া যায়নি", "ডাউনলোড ফোল্ডারটি খুঁজে পাওয়া যায়নি।")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(folder)  # noqa: S606 - intentional, opens in Explorer
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as ex:
+            messagebox.showerror("Error", f"ফোল্ডার খুলতে সমস্যা হয়েছে:\n{ex}")
+
+    def _open_file(self, filepath):
+        if not filepath or not os.path.isfile(filepath):
+            messagebox.showwarning("ফাইল পাওয়া যায়নি", "ভিডিও ফাইলটি খুঁজে পাওয়া যায়নি।")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(filepath)  # noqa: S606 - intentional, opens default player
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", filepath])
+            else:
+                subprocess.Popen(["xdg-open", filepath])
+        except Exception as ex:
+            messagebox.showerror("Error", f"ফাইলটি চালাতে সমস্যা হয়েছে:\n{ex}")
+
+    # ---------------- Download-complete popup ----------------
+    def _show_completion_modal(self, is_playlist, output_file, out_dir):
+        """Shown once a download finishes successfully.
+
+        Playlist downloads: Close / Open Folder.
+        Single video downloads: Close / Open Folder / Play.
+        The app auto-refreshes as soon as the popup is closed.
+        """
+        modal = tk.Toplevel(self)
+        modal.title("Download Complete")
+        modal.configure(bg=BG_CARD)
+        modal.transient(self)
+        modal.resizable(False, False)
+
+        wrap = ttk.Frame(modal, style="Card.TFrame", padding=20)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="✅ Download সম্পন্ন হয়েছে!",
+                  style="Body.TLabel", font=("Segoe UI Semibold", 12, "bold")
+                  ).pack(anchor="w", pady=(0, 8))
+
+        if is_playlist:
+            msg = "প্লেলিস্টের সবগুলো ভিডিও ডাউনলোড হয়ে গেছে।"
+        else:
+            fname = os.path.basename(output_file) if output_file else ""
+            msg = f"ফাইল সফলভাবে ডাউনলোড হয়েছে:\n{fname}" if fname else "ভিডিওটি সফলভাবে ডাউনলোড হয়েছে।"
+        ttk.Label(wrap, text=msg, style="Subtle.TLabel",
+                  wraplength=380, justify="left").pack(anchor="w", pady=(0, 14))
+
+        btn_row = ttk.Frame(wrap, style="Card.TFrame")
+        btn_row.pack(fill="x")
+
+        def do_close():
+            modal.destroy()
+            self._refresh_app()
+
+        def do_open_folder():
+            self._open_folder(out_dir)
+
+        def do_play():
+            self._open_file(output_file)
+
+        ttk.Button(btn_row, text="Close", style="Stop.TButton",
+                   command=do_close).pack(side="left")
+        ttk.Button(btn_row, text="📁 Open Folder", style="Ghost.TButton",
+                   command=do_open_folder).pack(side="left", padx=(10, 0))
+        if not is_playlist:
+            ttk.Button(btn_row, text="▶ Play", style="Accent.TButton",
+                       command=do_play).pack(side="left", padx=(10, 0))
+
+        modal.protocol("WM_DELETE_WINDOW", do_close)
+
+        modal.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - modal.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - modal.winfo_height()) // 2
+        modal.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        modal.grab_set()
+
     def _prepare_single_download(self, url, out_dir):
         """Runs in a worker thread: fetch the title, check for an existing file
         with the same name, ask the user if a duplicate is found, then download."""
@@ -1124,7 +1240,21 @@ class YTDLPGui(tk.Tk):
             self.status_var.set(f"Processing {playlist_tag}(merging/converting)...")
             self.speed_var.set("-- KB/s")
             self.eta_var.set("ETA --:--")
+            filename = d.get("filename")
+            if filename:
+                # Fallback in case no postprocessor hook fires (e.g. no merge/convert needed)
+                self._current_output_file = filename
             self._log(f"Finished downloading: {os.path.basename(d.get('filename', ''))}")
+
+    def _postprocessor_hook(self, d):
+        """Fires after each postprocessing step (merge, thumbnail embed, mp3
+        conversion, etc). We keep overwriting with the latest reported path so
+        that by the end we have the real final output file for the Play button."""
+        if d.get("status") == "finished":
+            info = d.get("info_dict", {}) or {}
+            filepath = info.get("filepath") or info.get("_filename")
+            if filepath:
+                self._current_output_file = filepath
 
     def _run_download(self, url, out_dir):
         try:
@@ -1142,6 +1272,10 @@ class YTDLPGui(tk.Tk):
                 self.speed_var.set("-- KB/s")
                 self.eta_var.set("ETA --:--")
                 self._log("Download completed successfully.")
+
+                is_playlist = self.playlist_var.get()
+                output_file = self._current_output_file
+                self.after(0, lambda: self._show_completion_modal(is_playlist, output_file, out_dir))
         except Exception as e:
             if self.stop_flag:
                 self._handle_stopped(out_dir)
@@ -1235,6 +1369,7 @@ class YTDLPGui(tk.Tk):
             "outtmpl": self._outtmpl(out_dir),
             "noplaylist": not self.playlist_var.get(),
             "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
             "format": fmt,
             "merge_output_format": "mp4",
             "postprocessors": thumb_postprocessors,
@@ -1259,6 +1394,7 @@ class YTDLPGui(tk.Tk):
             "outtmpl": self._outtmpl(out_dir),
             "noplaylist": not self.playlist_var.get(),
             "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
             "format": "bestaudio/best",
             "postprocessors": [
                 {
