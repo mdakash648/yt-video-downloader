@@ -1538,13 +1538,8 @@ class YTDLPGui(tk.Tk):
         if not url:
             messagebox.showwarning("No URL", "Media URL দিন।")
             return
-        if not referer:
-            if not messagebox.askyesno(
-                "No Referer",
-                "Referer URL দেওয়া হয়নি — কিছু URL ছাড়াও কাজ করতে পারে, "
-                "কিন্তু 403 error দেওয়া URL Referer ছাড়া কাজ করবে না।\n\nতবুও কি চালাব?"
-            ):
-                return
+        # No confirmation needed if referer is blank -- _download_url_with_headers
+        # will auto-fill it from the URL's own origin.
 
         out_dir = self.download_dir.get().strip()
         if not out_dir:
@@ -1614,8 +1609,35 @@ class YTDLPGui(tk.Tk):
                               state="disabled", style="Ghost.TButton")
         self.stop_btn.config(state="disabled")
 
+    @staticmethod
+    def _auto_referer_from_url(url):
+        """Derive a plausible Referer from a media URL's own origin, e.g.
+        'https://cdn.example.com/videos/x.mp4?token=..' -> 'https://cdn.example.com/'.
+        Returns '' if the URL can't be parsed into scheme+host."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}/"
+        except Exception:
+            pass
+        return ""
+
     def _download_url_with_headers(self, url, referer, user_agent, out_dir):
-        """Download a single URL through yt-dlp with custom HTTP headers."""
+        """Download a single URL through yt-dlp with custom HTTP headers.
+
+        If no referer was given (Direct URL box left empty, or an M3U entry
+        with no #EXTVLCOPT:http-referrer= tag), auto-fill it with the URL's
+        own origin (scheme://host/). Many CDN/ISP-FTP servers only check that
+        *some* referer from their own domain is present, so this alone fixes
+        a lot of 403 Forbidden errors without the user typing anything."""
+        referer = referer.strip() if referer else ""
+        if not referer:
+            auto_referer = self._auto_referer_from_url(url)
+            if auto_referer:
+                referer = auto_referer
+                self._log(f"[Auto-referer] কোনো Referer দেওয়া হয়নি — auto বসানো হলো: {referer}")
+
         headers = {}
         if referer:
             headers['Referer'] = referer
