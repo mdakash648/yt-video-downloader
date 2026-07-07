@@ -342,6 +342,7 @@ class YTDLPGui(tk.Tk):
         self.m3u_entries = []          # list of parsed M3U entries (dicts)
         self.m3u_check_vars = []       # [tk.BooleanVar, ...] per entry
         self.m3u_status_vars = {}      # idx -> tk.StringVar for status icon
+        self._m3u_group_names = []     # listbox index -> group name (for the group filter)
         self.m3u_status_label_var = tk.StringVar(value="M3U file browse করে Parse করুন — entries এখানে দেখা যাবে।")
         self._current_m3u_index = None
         self._tab_canvases = []        # populated in _build_ui, used by mousewheel handler
@@ -1201,9 +1202,39 @@ class YTDLPGui(tk.Tk):
         ttk.Label(list_inner, text="e.g. 1,3,5-10  or  1-5,7-9,20",
                   style="Subtle.TLabel").pack(anchor="w", pady=(0, 8))
 
+        # Group filter list — only shown after Parse when the M3U file has
+        # more than one group. User picks one or more group names and hits
+        # Apply to auto-select every entry belonging to those group(s).
+        self.m3u_group_frame = ttk.Frame(list_inner, style="Card.TFrame")
+        # Not packed yet — _parse_m3u packs it only when >1 group exists.
+
+        ttk.Label(self.m3u_group_frame, text="Group filter:", style="Subtle.TLabel").pack(anchor="w")
+        group_list_row = ttk.Frame(self.m3u_group_frame, style="Card.TFrame")
+        group_list_row.pack(fill="x", pady=(4, 0))
+
+        group_listbox_wrap = tk.Frame(group_list_row, bg=BG_INPUT, highlightbackground=BORDER, highlightthickness=1)
+        group_listbox_wrap.pack(side="left", fill="x", expand=True)
+        self.m3u_group_listbox = tk.Listbox(
+            group_listbox_wrap, selectmode="extended", height=5,
+            bg=BG_INPUT, fg=FG_TEXT, relief="flat", highlightthickness=0,
+            activestyle="none", exportselection=False,
+        )
+        self.m3u_group_listbox.pack(side="left", fill="x", expand=True, padx=(4, 0), pady=2)
+        group_scroll = ttk.Scrollbar(group_listbox_wrap, orient="vertical", command=self.m3u_group_listbox.yview)
+        self.m3u_group_listbox.configure(yscrollcommand=group_scroll.set)
+        group_scroll.pack(side="right", fill="y")
+
+        group_btn_col = ttk.Frame(group_list_row, style="Card.TFrame")
+        group_btn_col.pack(side="left", padx=(8, 0), fill="y")
+        ttk.Button(group_btn_col, text="✔ Apply Group", style="Ghost.TButton",
+                   command=self._m3u_apply_group_filter).pack(anchor="n")
+        ttk.Label(group_btn_col, text="(Ctrl/Shift দিয়ে একাধিক group select করা যায়)",
+                  style="Subtle.TLabel", wraplength=140, justify="left").pack(anchor="n", pady=(6, 0))
+
         # Treeview to show media list with checkboxes
         tree_wrap = tk.Frame(list_inner, bg=BG_INPUT, highlightbackground=BORDER, highlightthickness=1)
         tree_wrap.pack(fill="both", expand=True)
+        self.m3u_tree_wrap = tree_wrap  # kept so _parse_m3u can pack the group filter frame right before it
 
         self.m3u_tree = ttk.Treeview(
             tree_wrap,
@@ -1370,6 +1401,40 @@ class YTDLPGui(tk.Tk):
             f"✓ {len(entries)}টি entry parse হয়েছে। Groups: {', '.join(groups)}"
         )
         self._log(f"M3U parsed: {len(entries)} entries, groups = {groups}")
+
+        # Populate the group filter list. Only show it when there's more
+        # than one group — with a single group, filtering by group is
+        # pointless (it would just be "select all").
+        self.m3u_group_listbox.delete(0, "end")
+        if len(groups) > 1:
+            for g in groups:
+                count = sum(1 for e in entries if (e.get('group') or 'Default') == g)
+                self.m3u_group_listbox.insert("end", f"{g}  ({count})")
+            self._m3u_group_names = groups  # parallel list: listbox index -> group name
+            self.m3u_group_frame.pack(fill="x", pady=(0, 8), before=self.m3u_tree_wrap)
+        else:
+            self._m3u_group_names = []
+            self.m3u_group_frame.pack_forget()
+
+    def _m3u_apply_group_filter(self):
+        """Select only the M3U entries whose group matches one of the
+        group name(s) picked in the group listbox (multi-select)."""
+        if not self.m3u_check_vars:
+            messagebox.showinfo("No entries", "প্রথমে একটি M3U ফাইল parse করুন।")
+            return
+        picked_idxs = self.m3u_group_listbox.curselection()
+        if not picked_idxs:
+            messagebox.showinfo("No group selected", "অন্তত একটি group select করুন।")
+            return
+        picked_groups = {self._m3u_group_names[i] for i in picked_idxs}
+
+        for i, entry in enumerate(self.m3u_entries):
+            entry_group = entry.get('group') or "Default"
+            should_select = entry_group in picked_groups
+            self.m3u_check_vars[i].set(should_select)
+            self.m3u_tree.item(str(i), text="☑" if should_select else "☐")
+
+        self._log(f"M3U group filter applied: {', '.join(sorted(picked_groups))}")
 
     def _on_m3u_tree_click(self, event):
         """Toggle checkbox when the ✓ column is clicked."""
