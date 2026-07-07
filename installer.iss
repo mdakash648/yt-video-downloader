@@ -1,4 +1,5 @@
-; ============================================================
+
+Action: file_editor create /app/installer.iss --file-text "; ============================================================
 ; Inno Setup script for YT-DLP Downloader
 ; ============================================================
 ; Requires Inno Setup (free): https://jrsoftware.org/isdl.php
@@ -10,16 +11,16 @@
 ;
 ; To compile:
 ;   1) Open this file in Inno Setup (double-click it), OR
-;   2) From command line:  "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+;   2) From command line: \"C:\Program Files (x86)\Inno Setup 6\ISCC.exe\" installer.iss
 ;
 ; Output: Output\YTDLPDownloader-Setup.exe
 ; ============================================================
 
-#define MyAppName "YT-DLP Downloader"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "Akash"
-#define MyAppExeName "YTDLPDownloader.exe"
-#define MySourceDir "dist\YTDLPDownloader"
+#define MyAppName \"YT-DLP Downloader\"
+#define MyAppVersion \"1.1.0\"
+#define MyAppPublisher \"Akash\"
+#define MyAppExeName \"YTDLPDownloader.exe\"
+#define MySourceDir \"dist\YTDLPDownloader\"
 
 [Setup]
 AppId={{8F2C6E6E-6B7A-4E9A-9C4B-9C2F6D3B7A11}}
@@ -44,29 +45,31 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: \"english\"; MessagesFile: \"compiler:Default.isl\"
 
 [Tasks]
 ; Lets the user opt in/out of a desktop icon during install
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: \"desktopicon\"; Description: \"Create a &desktop shortcut\"; GroupDescription: \"Additional shortcuts:\"; Flags: unchecked
 
 [Files]
 ; Pulls in EVERYTHING from the onedir build folder (exe, bundled python
 ; runtime, yt_dlp code, ffmpeg\ subfolder, etc.) -- recursesubdirs makes
 ; sure ffmpeg\ffmpeg.exe / ffprobe.exe come along too.
-Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: \"{#MySourceDir}\*\"; DestDir: \"{app}\"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 ; Start Menu shortcut -> also makes the app show up in Windows Search
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+Name: \"{group}\{#MyAppName}\"; Filename: \"{app}\{#MyAppExeName}\"
+Name: \"{group}\Uninstall {#MyAppName}\"; Filename: \"{uninstallexe}\"
 ; Desktop shortcut (only if the user ticked the task above)
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: \"{autodesktop}\{#MyAppName}\"; Filename: \"{app}\{#MyAppExeName}\"; Tasks: desktopicon
 
 [Run]
-; Optional "Launch app now" checkbox at the end of setup
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; Optional \"Launch app now\" checkbox at the end of setup
+Filename: \"{app}\{#MyAppExeName}\"; Description: \"Launch {#MyAppName}\"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; Cleans up any log/temp files the app may have created inside its own folder
-Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: \"{app}\"
+"
+Observation: Create successful: /app/installer.iss

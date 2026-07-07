@@ -195,6 +195,88 @@ def format_eta(seconds):
     return f"{m:d}:{s:02d}"
 
 
+def parse_m3u_file(filepath):
+    """
+    Parse M3U/M3U8 file and extract media entries.
+
+    Returns: List of dicts with structure:
+    {
+        'title': str,
+        'url': str,
+        'referer': str or None,
+        'user_agent': str or None,
+        'group': str or None,
+        'logo': str or None
+    }
+    """
+    entries = []
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = [line.rstrip('\r\n') for line in f.readlines()]
+    except Exception as e:
+        raise Exception(f"M3U file পড়তে সমস্যা হয়েছে: {e}")
+
+    current_entry = {}
+
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        if line_stripped.startswith('#EXTM3U'):
+            continue
+
+        if line_stripped.startswith('#EXTINF:'):
+            # Reset current entry
+            current_entry = {}
+            # Extract tvg-logo
+            logo_match = re.search(r'tvg-logo="([^"]*)"', line_stripped)
+            if logo_match:
+                current_entry['logo'] = logo_match.group(1)
+            # Extract group-title
+            group_match = re.search(r'group-title="([^"]*)"', line_stripped)
+            if group_match:
+                current_entry['group'] = group_match.group(1)
+            # Extract title (after comma)
+            if ',' in line_stripped:
+                title = line_stripped.split(',', 1)[1].strip()
+                current_entry['title'] = title
+            else:
+                current_entry['title'] = f"Media {i+1}"
+
+        elif line_stripped.startswith('#EXTVLCOPT:http-referrer='):
+            current_entry['referer'] = line_stripped.split('=', 1)[1].strip()
+
+        elif line_stripped.startswith('#EXTVLCOPT:http-user-agent='):
+            current_entry['user_agent'] = line_stripped.split('=', 1)[1].strip()
+
+        elif line_stripped.startswith('#'):
+            # Ignore other comment lines (including auto_search_update)
+            continue
+
+        else:
+            # This is a media URL line
+            if line_stripped.startswith('http'):
+                current_entry['url'] = line_stripped
+                # Set defaults for missing fields
+                current_entry.setdefault('title', f"Media {len(entries)+1}")
+                current_entry.setdefault('referer', None)
+                current_entry.setdefault('user_agent', None)
+                current_entry.setdefault('group', "Default")
+                current_entry.setdefault('logo', None)
+                entries.append(current_entry.copy())
+                current_entry = {}
+
+    return entries
+
+
+def sanitize_folder_name(name):
+    """Sanitize folder name for filesystem."""
+    name = re.sub(r'[<>:"/\\|?*]', '', name or "")
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip() or "Default"
+
+
 class YTDLPGui(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -248,6 +330,21 @@ class YTDLPGui(tk.Tk):
         self._format_fetch_generation = 0   # bumped on every new URL so stale background fetches self-cancel
         self.estimated_size_var = tk.StringVar(value="")            # shown next to the Download button
         self.estimated_size_progress_var = tk.StringVar(value="--")  # shown in the Progress card
+
+        # ---- Tab 2: Direct / M3U Downloader state ----
+        self.direct_url_var = tk.StringVar()
+        self.direct_referer_var = tk.StringVar()
+        self.direct_user_agent_var = tk.StringVar(
+            value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        self.m3u_file_path_var = tk.StringVar()
+        self.m3u_entries = []          # list of parsed M3U entries (dicts)
+        self.m3u_check_vars = []       # [tk.BooleanVar, ...] per entry
+        self.m3u_status_vars = {}      # idx -> tk.StringVar for status icon
+        self.m3u_status_label_var = tk.StringVar(value="M3U file browse করে Parse করুন — entries এখানে দেখা যাবে।")
+        self._current_m3u_index = None
+        self._tab_canvases = []        # populated in _build_ui, used by mousewheel handler
 
         self._setup_styles()
         self._build_ui()
@@ -581,6 +678,51 @@ class YTDLPGui(tk.Tk):
                          background=ACCENT, bordercolor=BG_INPUT,
                          lightcolor=ACCENT, darkcolor=ACCENT, thickness=14)
 
+        # ------- Notebook (Tabs) styling -------
+        # The default 'clam' notebook has a light grey unselected tab strip that
+        # clashes badly with our dark theme. Fully re-skin it to match.
+        style.configure("TNotebook", background=BG_MAIN, borderwidth=0,
+                         tabmargins=(0, 6, 0, 0))
+        style.configure("TNotebook.Tab",
+                         background=BG_CARD_ALT,
+                         foreground=FG_SUBTLE,
+                         padding=(22, 10),
+                         font=("Segoe UI Semibold", 10, "bold"),
+                         borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", ACCENT), ("active", BG_CARD)],
+                  foreground=[("selected", "#ffffff"), ("active", FG_TEXT)],
+                  expand=[("selected", (0, 0, 0, 0))])
+        # Remove the default focus dotted rectangle that ttk draws over tabs
+        style.layout("TNotebook.Tab", [
+            ("Notebook.tab", {"sticky": "nswe", "children": [
+                ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                    ("Notebook.label", {"side": "top", "sticky": ""})
+                ]})
+            ]})
+        ])
+
+        # ------- Treeview (used by the M3U media list) -------
+        style.configure("Treeview",
+                         background=BG_INPUT,
+                         foreground=FG_TEXT,
+                         fieldbackground=BG_INPUT,
+                         borderwidth=0,
+                         rowheight=26,
+                         font=("Segoe UI", 10))
+        style.map("Treeview",
+                  background=[("selected", ACCENT)],
+                  foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading",
+                         background=BG_CARD,
+                         foreground=FG_TEXT,
+                         font=("Segoe UI Semibold", 9, "bold"),
+                         borderwidth=0,
+                         relief="flat",
+                         padding=(8, 6))
+        style.map("Treeview.Heading",
+                  background=[("active", BG_CARD_ALT)])
+
     def _card(self, parent, title=None):
         outer = ttk.Frame(parent, style="Main.TFrame")
         card = tk.Frame(outer, bg=BG_CARD, highlightbackground=BORDER,
@@ -594,16 +736,41 @@ class YTDLPGui(tk.Tk):
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        # Canvas + scrollbar wrapper so the whole layout is scrollable on small screens
-        container = tk.Frame(self, bg=BG_MAIN)
-        container.pack(fill="both", expand=True)
+        # Outer wrapper - contains header (top), notebook (middle), everything else
+        outer = tk.Frame(self, bg=BG_MAIN)
+        outer.pack(fill="both", expand=True)
 
-        self.canvas = tk.Canvas(container, bg=BG_MAIN, highlightthickness=0, bd=0)
-        vscroll = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vscroll.set)
+        # ---- Persistent Header (above the notebook, always visible) ----
+        header = ttk.Frame(outer, style="Main.TFrame", padding=(18, 14, 18, 4))
+        header.pack(fill="x")
+        header_top = ttk.Frame(header, style="Main.TFrame")
+        header_top.pack(fill="x")
+        title_box = ttk.Frame(header_top, style="Main.TFrame")
+        title_box.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_box, text="⬇ YT-DLP Downloader", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(title_box,
+                  text="YouTube/playlist ডাউনলোড + Direct URL / M3U playlist ডাউনলোড",
+                  style="SubHeader.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Button(header_top, text="🔄 Refresh  (Ctrl+R)", style="Ghost.TButton",
+                   command=self._refresh_app).pack(side="right", anchor="n")
+        self.update_check_btn = ttk.Button(header_top, text="⬆ yt-dlp Update Check", style="Ghost.TButton",
+                                            command=lambda: self._check_ytdlp_update(manual=True))
+        self.update_check_btn.pack(side="right", anchor="n", padx=(0, 8))
 
+        # ---- Notebook (Tabs) - each tab has its own scrollable canvas ----
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(6, 10))
+
+        # ===== TAB 1: YouTube / Video Downloader (original features) =====
+        tab1 = ttk.Frame(self.notebook, style="Main.TFrame")
+        self.notebook.add(tab1, text="  🎬  YouTube / Video Downloader  ")
+
+        # Scrollable canvas for Tab 1
+        self.canvas = tk.Canvas(tab1, bg=BG_MAIN, highlightthickness=0, bd=0)
+        vscroll1 = ttk.Scrollbar(tab1, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vscroll1.set)
         self.canvas.pack(side="left", fill="both", expand=True)
-        vscroll.pack(side="right", fill="y")
+        vscroll1.pack(side="right", fill="y")
 
         root = ttk.Frame(self.canvas, style="Main.TFrame")
         self._canvas_window = self.canvas.create_window((0, 0), window=root, anchor="nw")
@@ -612,43 +779,12 @@ class YTDLPGui(tk.Tk):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
         def _on_canvas_configure(event):
-            # Keep the inner frame the same width as the visible canvas
             self.canvas.itemconfig(self._canvas_window, width=event.width)
 
         root.bind("<Configure>", _on_frame_configure)
         self.canvas.bind("<Configure>", _on_canvas_configure)
 
-        def _on_mousewheel(event):
-            if event.num == 4:
-                self.canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                self.canvas.yview_scroll(1, "units")
-            else:
-                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        # Windows / macOS
-        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        # Linux
-        self.canvas.bind_all("<Button-4>", _on_mousewheel)
-        self.canvas.bind_all("<Button-5>", _on_mousewheel)
-
-        root.configure(padding=(18, 16))
-
-        # Header
-        header = ttk.Frame(root, style="Main.TFrame")
-        header.pack(fill="x", pady=(0, 14))
-        header_top = ttk.Frame(header, style="Main.TFrame")
-        header_top.pack(fill="x")
-        title_box = ttk.Frame(header_top, style="Main.TFrame")
-        title_box.pack(side="left", fill="x", expand=True)
-        ttk.Label(title_box, text="⬇ YT-DLP Downloader", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(title_box, text="Download videos, playlists, or audio from any supported site",
-                  style="SubHeader.TLabel").pack(anchor="w", pady=(2, 0))
-        ttk.Button(header_top, text="🔄 Refresh  (Ctrl+R)", style="Ghost.TButton",
-                   command=self._refresh_app).pack(side="right", anchor="n")
-        self.update_check_btn = ttk.Button(header_top, text="⬆ yt-dlp Update Check", style="Ghost.TButton",
-                                            command=lambda: self._check_ytdlp_update(manual=True))
-        self.update_check_btn.pack(side="right", anchor="n", padx=(0, 8))
+        root.configure(padding=(18, 12))
 
         # URL card
         url_outer, url_inner = self._card(root, "Video / Playlist URL")
@@ -818,8 +954,52 @@ class YTDLPGui(tk.Tk):
         self.deselect_all_titles_btn.pack(side="left", padx=(8, 0))
         self.deselect_all_titles_btn.config(state="disabled")
 
-        self.titles_list_frame = ttk.Frame(pv_inner, style="Card.TFrame")
-        self.titles_list_frame.pack(fill="x", pady=(8, 0))
+        # -------- Bounded scrollable container for the title checkboxes --------
+        # Fixed height so a 50-video playlist doesn't push everything else off
+        # the screen. Users scroll INSIDE this box, not the whole page.
+        self.titles_container = tk.Frame(
+            pv_inner, bg=BG_INPUT, highlightbackground=BORDER,
+            highlightthickness=1, height=280
+        )
+        self.titles_container.pack(fill="x", pady=(8, 0))
+        self.titles_container.pack_propagate(False)  # keep the fixed 280px height
+
+        self.titles_canvas = tk.Canvas(
+            self.titles_container, bg=BG_INPUT,
+            highlightthickness=0, bd=0
+        )
+        titles_scroll = ttk.Scrollbar(
+            self.titles_container, orient="vertical",
+            command=self.titles_canvas.yview
+        )
+        self.titles_canvas.configure(yscrollcommand=titles_scroll.set)
+        self.titles_canvas.pack(side="left", fill="both", expand=True)
+        titles_scroll.pack(side="right", fill="y")
+
+        self.titles_list_frame = ttk.Frame(self.titles_canvas, style="Card.TFrame")
+        self._titles_canvas_window = self.titles_canvas.create_window(
+            (0, 0), window=self.titles_list_frame, anchor="nw"
+        )
+
+        def _on_titles_frame_configure(event=None):
+            self.titles_canvas.configure(scrollregion=self.titles_canvas.bbox("all"))
+
+        def _on_titles_canvas_configure(event):
+            self.titles_canvas.itemconfig(self._titles_canvas_window, width=event.width)
+
+        self.titles_list_frame.bind("<Configure>", _on_titles_frame_configure)
+        self.titles_canvas.bind("<Configure>", _on_titles_canvas_configure)
+
+        # Placeholder text shown before any titles are loaded (so the box
+        # doesn't look empty/broken to the user before they hit "Load Titles")
+        self.titles_placeholder = ttk.Label(
+            self.titles_list_frame,
+            text="Playlist URL paste করে '🔄 Load / Refresh Titles' চাপুন —\n"
+                 "video titles এখানে checkbox list হিসেবে দেখা যাবে।",
+            style="Subtle.TLabel", justify="left"
+        )
+        self.titles_placeholder.pack(anchor="w", padx=10, pady=14)
+
         self.video_check_vars = []
 
         # Action buttons
@@ -895,6 +1075,594 @@ class YTDLPGui(tk.Tk):
         self.log_box.pack(fill="both", expand=True)
 
         self._sync_playlist_controls()
+
+        # ===== TAB 2: Direct URL / M3U Downloader =====
+        tab2 = ttk.Frame(self.notebook, style="Main.TFrame")
+        self.notebook.add(tab2, text="  🔗  Direct URL / M3U Downloader  ")
+        self._build_tab2(tab2)
+
+        # Register both canvases for mousewheel routing (see _on_mousewheel_global)
+        self._tab_canvases = [self.canvas, self.tab2_canvas]
+
+        # Bind mousewheel ONCE globally, routed to the active tab's canvas.
+        # (Previous versions used self.canvas.bind_all which broke after adding
+        # a second canvas — the second canvas would silently steal all wheel
+        # events. Using a single handler + tab detection fixes that.)
+        self.bind_all("<MouseWheel>", self._on_mousewheel_global)
+        self.bind_all("<Button-4>", self._on_mousewheel_global)
+        self.bind_all("<Button-5>", self._on_mousewheel_global)
+
+    # ================================================================
+    # TAB 2: DIRECT URL / M3U DOWNLOADER
+    # ================================================================
+    def _build_tab2(self, parent):
+        """Build the content of Tab 2 (Direct URL + M3U playlist downloader)."""
+        # Scrollable canvas for Tab 2
+        self.tab2_canvas = tk.Canvas(parent, bg=BG_MAIN, highlightthickness=0, bd=0)
+        vscroll2 = ttk.Scrollbar(parent, orient="vertical", command=self.tab2_canvas.yview)
+        self.tab2_canvas.configure(yscrollcommand=vscroll2.set)
+        self.tab2_canvas.pack(side="left", fill="both", expand=True)
+        vscroll2.pack(side="right", fill="y")
+
+        root = ttk.Frame(self.tab2_canvas, style="Main.TFrame")
+        self._tab2_canvas_window = self.tab2_canvas.create_window((0, 0), window=root, anchor="nw")
+
+        def _on_frame_configure(event=None):
+            self.tab2_canvas.configure(scrollregion=self.tab2_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            self.tab2_canvas.itemconfig(self._tab2_canvas_window, width=event.width)
+
+        root.bind("<Configure>", _on_frame_configure)
+        self.tab2_canvas.bind("<Configure>", _on_canvas_configure)
+
+        root.configure(padding=(18, 12))
+
+        # ---- Section A: Direct CDN URL Download ----
+        direct_outer, direct_inner = self._card(root, "Direct CDN URL (Referer সহ)")
+        direct_outer.pack(fill="x", pady=(0, 12))
+
+        ttk.Label(direct_inner,
+                  text="403 Forbidden দেয় এমন URL Referer header দিয়ে ডাউনলোড করুন (auto-referrer)।",
+                  style="Subtle.TLabel", wraplength=760, justify="left").pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(direct_inner, text="Media URL", style="Subtle.TLabel").pack(anchor="w")
+        url_row = ttk.Frame(direct_inner, style="Card.TFrame")
+        url_row.pack(fill="x", pady=(4, 8))
+        ttk.Entry(url_row, textvariable=self.direct_url_var, style="TEntry").pack(
+            side="left", fill="x", expand=True, ipady=3
+        )
+        ttk.Button(url_row, text="📋 Paste", style="Ghost.TButton",
+                   command=lambda: self._paste_into_var(self.direct_url_var)).pack(side="left", padx=(10, 0))
+
+        ttk.Label(direct_inner, text="Referer URL", style="Subtle.TLabel").pack(anchor="w")
+        ref_row = ttk.Frame(direct_inner, style="Card.TFrame")
+        ref_row.pack(fill="x", pady=(4, 8))
+        ttk.Entry(ref_row, textvariable=self.direct_referer_var, style="TEntry").pack(
+            side="left", fill="x", expand=True, ipady=3
+        )
+        ttk.Button(ref_row, text="📋 Paste", style="Ghost.TButton",
+                   command=lambda: self._paste_into_var(self.direct_referer_var)).pack(side="left", padx=(10, 0))
+
+        ttk.Label(direct_inner, text="User-Agent (optional)", style="Subtle.TLabel").pack(anchor="w")
+        ttk.Entry(direct_inner, textvariable=self.direct_user_agent_var, style="TEntry").pack(
+            fill="x", pady=(4, 10), ipady=3
+        )
+
+        direct_btn_row = ttk.Frame(direct_inner, style="Card.TFrame")
+        direct_btn_row.pack(fill="x")
+        self.direct_download_btn = ttk.Button(
+            direct_btn_row, text="⬇  Download (Direct URL)", style="Accent.TButton",
+            command=self._start_direct_download
+        )
+        self.direct_download_btn.pack(side="left")
+
+        # ---- Section B: M3U/M3U8 file loader ----
+        m3u_outer, m3u_inner = self._card(root, "M3U / M3U8 Playlist File")
+        m3u_outer.pack(fill="x", pady=(0, 12))
+
+        ttk.Label(m3u_inner,
+                  text="M3U/M3U8 ফাইল লোড করুন — প্রতিটি entry-এর title, referer, user-agent এবং "
+                       "group auto detect হবে।",
+                  style="Subtle.TLabel", wraplength=760, justify="left").pack(anchor="w", pady=(0, 8))
+
+        m3u_file_row = ttk.Frame(m3u_inner, style="Card.TFrame")
+        m3u_file_row.pack(fill="x", pady=(0, 8))
+        ttk.Entry(m3u_file_row, textvariable=self.m3u_file_path_var, style="TEntry",
+                  state="readonly").pack(side="left", fill="x", expand=True, ipady=3)
+        ttk.Button(m3u_file_row, text="📂 Browse M3U", style="Ghost.TButton",
+                   command=self._browse_m3u_file).pack(side="left", padx=(10, 0))
+        ttk.Button(m3u_file_row, text="🔄 Parse", style="Accent.TButton",
+                   command=self._parse_m3u).pack(side="left", padx=(6, 0))
+
+        ttk.Label(m3u_inner, textvariable=self.m3u_status_label_var,
+                  style="Subtle.TLabel", wraplength=760, justify="left").pack(anchor="w", pady=(4, 0))
+
+        # ---- Section C: Media list (Treeview) + action buttons ----
+        list_outer, list_inner = self._card(root, "Media List (M3U entries)")
+        list_outer.pack(fill="both", expand=True, pady=(0, 12))
+
+        list_actions = ttk.Frame(list_inner, style="Card.TFrame")
+        list_actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(list_actions, text="Select All", style="Ghost.TButton",
+                   command=lambda: self._m3u_set_all(True)).pack(side="left")
+        ttk.Button(list_actions, text="Deselect All", style="Ghost.TButton",
+                   command=lambda: self._m3u_set_all(False)).pack(side="left", padx=(6, 0))
+
+        # Range input (like playlist range: "1,5,10-15")
+        range_row = ttk.Frame(list_inner, style="Card.TFrame")
+        range_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(range_row, text="Range select:", style="Subtle.TLabel").pack(side="left")
+        self.m3u_range_var = tk.StringVar()
+        self.m3u_range_entry = ttk.Entry(range_row, textvariable=self.m3u_range_var, style="TEntry")
+        self.m3u_range_entry.pack(side="left", fill="x", expand=True, padx=(8, 0), ipady=2)
+        ttk.Button(range_row, text="✔ Apply Range", style="Ghost.TButton",
+                   command=self._m3u_apply_range).pack(side="left", padx=(6, 0))
+        ttk.Label(list_inner, text="e.g. 1,3,5-10  or  1-5,7-9,20",
+                  style="Subtle.TLabel").pack(anchor="w", pady=(0, 8))
+
+        # Treeview to show media list with checkboxes
+        tree_wrap = tk.Frame(list_inner, bg=BG_INPUT, highlightbackground=BORDER, highlightthickness=1)
+        tree_wrap.pack(fill="both", expand=True)
+
+        self.m3u_tree = ttk.Treeview(
+            tree_wrap,
+            columns=("status", "title", "group"),
+            show="tree headings",
+            height=12,
+            selectmode="none"
+        )
+        self.m3u_tree.heading("#0", text="✓")
+        self.m3u_tree.heading("status", text="Status")
+        self.m3u_tree.heading("title", text="Title")
+        self.m3u_tree.heading("group", text="Group")
+
+        self.m3u_tree.column("#0", width=48, anchor="center", stretch=False)
+        self.m3u_tree.column("status", width=70, anchor="center", stretch=False)
+        self.m3u_tree.column("title", width=440, anchor="w", stretch=True)
+        self.m3u_tree.column("group", width=160, anchor="w", stretch=False)
+
+        tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.m3u_tree.yview)
+        self.m3u_tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.m3u_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+
+        # Click on the ✓ column toggles that row's checkbox
+        self.m3u_tree.bind("<Button-1>", self._on_m3u_tree_click)
+
+        # Action buttons for M3U batch
+        m3u_btn_row = ttk.Frame(list_inner, style="Card.TFrame")
+        m3u_btn_row.pack(fill="x", pady=(10, 0))
+        self.m3u_download_btn = ttk.Button(
+            m3u_btn_row, text="⬇  Download Selected (All)", style="Accent.TButton",
+            command=self._start_m3u_batch_download
+        )
+        self.m3u_download_btn.pack(side="left")
+        ttk.Label(m3u_btn_row,
+                  text="প্রতিটি entry-র জন্য group অনুযায়ী subfolder auto তৈরি হবে।",
+                  style="Subtle.TLabel").pack(side="left", padx=(14, 0))
+
+    # ---------------- Mousewheel routing (fix for multi-tab scrolling) ----------------
+    def _on_mousewheel_global(self, event):
+        """Route mouse wheel to whichever tab's canvas is currently visible.
+        Special case: when the cursor is over the inner titles_canvas (the
+        bounded playlist-titles box), scroll THAT instead of the outer tab
+        canvas, so the user can scroll through 50+ video titles without
+        moving the whole page. Widgets that manage their own scroll (Text,
+        Listbox, Treeview) are skipped."""
+        widget = event.widget
+        try:
+            wclass = widget.winfo_class() if widget else ""
+        except tk.TclError:
+            wclass = ""
+        if wclass in ("Text", "Listbox", "Treeview", "TCombobox"):
+            return
+
+        # Walk up: any parent Text/Listbox/Treeview should also block us
+        w = widget
+        try:
+            while w is not None:
+                if w.winfo_class() in ("Text", "Listbox", "Treeview"):
+                    return
+                w = w.master
+        except (tk.TclError, AttributeError):
+            pass
+
+        # If the mouse is over the inner titles list (or any of its children),
+        # scroll THAT canvas instead of the outer tab canvas.
+        target_canvas = None
+        try:
+            titles_canvas = getattr(self, "titles_canvas", None)
+            if titles_canvas is not None:
+                w2 = widget
+                while w2 is not None:
+                    if w2 is titles_canvas or w2 is self.titles_list_frame:
+                        target_canvas = titles_canvas
+                        break
+                    w2 = w2.master
+        except (tk.TclError, AttributeError):
+            pass
+
+        # Fall back to the active tab's outer canvas
+        if target_canvas is None:
+            try:
+                idx = self.notebook.index("current")
+            except (AttributeError, tk.TclError):
+                return
+            if not self._tab_canvases or idx >= len(self._tab_canvases):
+                return
+            target_canvas = self._tab_canvases[idx]
+
+        try:
+            if event.num == 4:
+                target_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                target_canvas.yview_scroll(1, "units")
+            else:
+                target_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except tk.TclError:
+            pass
+
+    # ---------------- Tab 2: Helper methods ----------------
+    def _paste_into_var(self, string_var):
+        """Paste clipboard content into a StringVar (used by Direct URL + Referer)."""
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            text = ""
+        if not text:
+            messagebox.showinfo("Clipboard খালি", "ক্লিপবোর্ডে কোনো লেখা পাওয়া যায়নি।")
+            return
+        string_var.set(text)
+
+    def _browse_m3u_file(self):
+        """Open file dialog to pick an M3U/M3U8 file."""
+        filepath = filedialog.askopenfilename(
+            title="Select M3U / M3U8 File",
+            filetypes=[("M3U/M3U8 Files", "*.m3u *.m3u8"), ("All Files", "*.*")]
+        )
+        if filepath:
+            self.m3u_file_path_var.set(filepath)
+
+    def _parse_m3u(self):
+        """Parse the loaded M3U file and populate the Treeview."""
+        filepath = self.m3u_file_path_var.get().strip()
+        if not filepath or not os.path.isfile(filepath):
+            messagebox.showwarning("No file", "প্রথমে একটি M3U/M3U8 ফাইল select করুন।")
+            return
+
+        try:
+            entries = parse_m3u_file(filepath)
+        except Exception as e:
+            self.m3u_status_label_var.set(f"❌ Parse ব্যর্থ: {e}")
+            messagebox.showerror("Parse Error", str(e))
+            return
+
+        if not entries:
+            self.m3u_status_label_var.set("⚠ কোনো media entry পাওয়া যায়নি M3U ফাইলে।")
+            return
+
+        # Reset state
+        self.m3u_entries = entries
+        self.m3u_check_vars = [tk.BooleanVar(value=True) for _ in entries]
+        self.m3u_status_vars = {}
+
+        # Clear existing treeview
+        for iid in self.m3u_tree.get_children():
+            self.m3u_tree.delete(iid)
+
+        # Populate treeview
+        for i, entry in enumerate(entries):
+            title = entry.get('title') or f"Media {i+1}"
+            group = entry.get('group') or "Default"
+            status_var = tk.StringVar(value="⏳")
+            self.m3u_status_vars[i] = status_var
+            self.m3u_tree.insert(
+                "", "end",
+                iid=str(i),
+                text="☑",
+                values=(status_var.get(), f"{i+1}. {title}", group),
+            )
+
+        groups = sorted(set((e.get('group') or 'Default') for e in entries))
+        self.m3u_status_label_var.set(
+            f"✓ {len(entries)}টি entry parse হয়েছে। Groups: {', '.join(groups)}"
+        )
+        self._log(f"M3U parsed: {len(entries)} entries, groups = {groups}")
+
+    def _on_m3u_tree_click(self, event):
+        """Toggle checkbox when the ✓ column is clicked."""
+        region = self.m3u_tree.identify("region", event.x, event.y)
+        if region != "tree":
+            return  # Only toggle when clicking the tree column (the ✓ box)
+        row_iid = self.m3u_tree.identify_row(event.y)
+        if not row_iid:
+            return
+        try:
+            idx = int(row_iid)
+        except ValueError:
+            return
+        if idx >= len(self.m3u_check_vars):
+            return
+        new_val = not self.m3u_check_vars[idx].get()
+        self.m3u_check_vars[idx].set(new_val)
+        self.m3u_tree.item(row_iid, text="☑" if new_val else "☐")
+
+    def _m3u_set_all(self, value):
+        """Bulk select/deselect every M3U entry."""
+        for i, var in enumerate(self.m3u_check_vars):
+            var.set(value)
+            self.m3u_tree.item(str(i), text="☑" if value else "☐")
+
+    def _m3u_apply_range(self):
+        """Apply a text range like '1,3,5-10' to the M3U selection."""
+        text = self.m3u_range_var.get().strip()
+        if not text:
+            messagebox.showinfo("Empty range", "একটি range লিখুন (e.g. 1,3,5-10)।")
+            return
+        if not self.m3u_check_vars:
+            messagebox.showinfo("No entries", "প্রথমে একটি M3U ফাইল parse করুন।")
+            return
+        selected_1based = self._parse_playlist_items(text)
+        if not selected_1based:
+            messagebox.showwarning("Invalid range", "Range parse করা যায়নি।")
+            return
+        # Convert to 0-based and select only those
+        for i, var in enumerate(self.m3u_check_vars):
+            should_select = (i + 1) in selected_1based
+            var.set(should_select)
+            self.m3u_tree.item(str(i), text="☑" if should_select else "☐")
+
+    def _m3u_update_tree_status(self, idx, symbol):
+        """Update the Status column icon for one M3U row."""
+        try:
+            self.m3u_tree.set(str(idx), "status", symbol)
+        except tk.TclError:
+            pass
+
+    # ---------------- Tab 2: Direct URL download ----------------
+    def _start_direct_download(self):
+        if yt_dlp is None:
+            messagebox.showerror("Missing dependency",
+                                 "Please install yt-dlp first:\n\npip install yt-dlp")
+            return
+        url = self.direct_url_var.get().strip()
+        referer = self.direct_referer_var.get().strip()
+        if not url:
+            messagebox.showwarning("No URL", "Media URL দিন।")
+            return
+        if not referer:
+            if not messagebox.askyesno(
+                "No Referer",
+                "Referer URL দেওয়া হয়নি — কিছু URL ছাড়াও কাজ করতে পারে, "
+                "কিন্তু 403 error দেওয়া URL Referer ছাড়া কাজ করবে না।\n\nতবুও কি চালাব?"
+            ):
+                return
+
+        out_dir = self.download_dir.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No folder", "Download folder select করুন।")
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        self._save_last_dir()
+
+        user_agent = self.direct_user_agent_var.get().strip() or None
+
+        self.stop_flag = False
+        self.pause_flag = False
+        self._current_output_file = None
+        self.progress["value"] = 0
+        self._reset_stats()
+        self.status_var.set("Starting direct download...")
+
+        self.direct_download_btn.config(state="disabled")
+        self.download_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled")   # pause not supported for direct URL yet
+        self.stop_btn.config(state="normal")
+
+        self._log(f"[Direct] Downloading: {url}")
+        if referer:
+            self._log(f"[Direct] Referer: {referer}")
+
+        self.worker_thread = threading.Thread(
+            target=self._direct_download_worker,
+            args=(url, referer, user_agent, out_dir),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _direct_download_worker(self, url, referer, user_agent, out_dir):
+        try:
+            self._download_url_with_headers(url, referer, user_agent, out_dir)
+            if self.stop_flag:
+                self.status_var.set("Stopped.")
+                self._log("[Direct] Stopped by user.")
+            else:
+                self.status_var.set("Done!")
+                self.progress["value"] = 100
+                self.percent_var.set("100%")
+                self.speed_var.set("-- KB/s")
+                self.eta_var.set("ETA --:--")
+                self._log("[Direct] ✅ Download completed.")
+                is_playlist = False
+                output_file = self._current_output_file
+                self.after(0, lambda: self._show_completion_modal(is_playlist, output_file, out_dir))
+        except Exception as e:
+            if self.stop_flag:
+                self.status_var.set("Stopped.")
+                self._log("[Direct] Stopped by user.")
+            else:
+                self.status_var.set("Error occurred.")
+                self._log(f"[Direct] ❌ Error: {e}")
+                err_msg = str(e)
+                self.after(0, lambda m=err_msg: messagebox.showerror("Download error", m))
+        finally:
+            self.after(0, self._reset_tab2_download_buttons)
+
+    def _reset_tab2_download_buttons(self):
+        self.direct_download_btn.config(state="normal")
+        self.m3u_download_btn.config(state="normal")
+        self.download_btn.config(state="normal")
+        self.pause_btn.config(text="⏸  Pause", command=self._pause_download,
+                              state="disabled", style="Ghost.TButton")
+        self.stop_btn.config(state="disabled")
+
+    def _download_url_with_headers(self, url, referer, user_agent, out_dir):
+        """Download a single URL through yt-dlp with custom HTTP headers."""
+        headers = {}
+        if referer:
+            headers['Referer'] = referer
+        if user_agent:
+            headers['User-Agent'] = user_agent
+
+        # Try to extract a filename from the URL, otherwise use %(title)s
+        filename_from_url = os.path.basename(url.split('?')[0].rstrip('/'))
+        if filename_from_url and '.' in filename_from_url:
+            # URL has a proper filename with extension - use it as-is
+            try:
+                from urllib.parse import unquote
+                filename_from_url = unquote(filename_from_url)
+            except Exception:
+                pass
+            outtmpl = os.path.join(out_dir, filename_from_url)
+        else:
+            outtmpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
+            "http_headers": headers,
+            "continuedl": True,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": False,
+            **self._ffmpeg_opt(),
+            **self._ratelimit_opt(),
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+    # ---------------- Tab 2: M3U batch download ----------------
+    def _start_m3u_batch_download(self):
+        if yt_dlp is None:
+            messagebox.showerror("Missing dependency",
+                                 "Please install yt-dlp first:\n\npip install yt-dlp")
+            return
+        if not self.m3u_entries:
+            messagebox.showwarning("No entries", "প্রথমে একটি M3U ফাইল parse করুন।")
+            return
+
+        selected_indices = [i for i, var in enumerate(self.m3u_check_vars) if var.get()]
+        if not selected_indices:
+            messagebox.showwarning("Nothing selected", "অন্তত একটি entry select করুন।")
+            return
+
+        out_dir = self.download_dir.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No folder", "Download folder select করুন।")
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        self._save_last_dir()
+
+        self.stop_flag = False
+        self.pause_flag = False
+        self._current_output_file = None
+        self.progress["value"] = 0
+        self._reset_stats()
+        self.status_var.set("Starting M3U batch download...")
+
+        self.direct_download_btn.config(state="disabled")
+        self.m3u_download_btn.config(state="disabled")
+        self.download_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled")  # not supported for batch
+        self.stop_btn.config(state="normal")
+
+        self._log(f"[M3U] Batch শুরু — {len(selected_indices)}টি entry download হবে।")
+
+        self.worker_thread = threading.Thread(
+            target=self._m3u_batch_worker,
+            args=(selected_indices, out_dir),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _m3u_batch_worker(self, selected_indices, out_dir):
+        """Runs in a worker thread: download every selected M3U entry into
+        subfolders named after its 'group' field."""
+        total = len(selected_indices)
+        success = 0
+        failed = 0
+
+        for i, idx in enumerate(selected_indices, start=1):
+            if self.stop_flag:
+                break
+            entry = self.m3u_entries[idx]
+            title = entry.get('title') or f"Media {idx+1}"
+            group = entry.get('group') or "Default"
+            group_folder = sanitize_folder_name(group)
+            target_dir = os.path.join(out_dir, group_folder)
+            os.makedirs(target_dir, exist_ok=True)
+
+            self._current_m3u_index = idx
+            status_var = self.m3u_status_vars.get(idx)
+            if status_var:
+                status_var.set("⬇")
+            self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "⬇"))
+
+            self.playlist_progress_var.set(f"{i}/{total}")
+            self.status_var.set(f"[M3U {i}/{total}] {title}")
+            self._log(f"[M3U {i}/{total}] Downloading: {title}  →  {group_folder}/")
+
+            try:
+                self._download_url_with_headers(
+                    entry['url'],
+                    entry.get('referer'),
+                    entry.get('user_agent'),
+                    target_dir,
+                )
+                if self.stop_flag:
+                    self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "⏳"))
+                    if status_var:
+                        status_var.set("⏳")
+                    break
+                success += 1
+                if status_var:
+                    status_var.set("✅")
+                self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "✅"))
+                self._log(f"[M3U {i}/{total}] ✅ Done: {title}")
+            except Exception as e:
+                if self.stop_flag:
+                    self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "⏳"))
+                    if status_var:
+                        status_var.set("⏳")
+                    break
+                failed += 1
+                if status_var:
+                    status_var.set("❌")
+                self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "❌"))
+                self._log(f"[M3U {i}/{total}] ❌ Failed: {title}  →  {e}")
+
+        self._current_m3u_index = None
+
+        if self.stop_flag:
+            self.status_var.set("Stopped.")
+            self._log(f"[M3U] Stopped by user. Success: {success}, Failed: {failed}, Total: {total}")
+        else:
+            self.status_var.set("M3U batch finished!")
+            self.progress["value"] = 100
+            self.percent_var.set("100%")
+            self.speed_var.set("-- KB/s")
+            self.eta_var.set("ETA --:--")
+            self._log(f"[M3U] ✅ Batch complete — Success: {success}, Failed: {failed}, Total: {total}")
+            self.after(0, lambda: messagebox.showinfo(
+                "M3U Batch Complete",
+                f"মোট {total}টি entry:\n✅ সফল: {success}\n❌ ব্যর্থ: {failed}"
+            ))
+
+        self.after(0, self._reset_tab2_download_buttons)
 
     def _cookies_opt(self):
         browser = self.browser_var.get()
@@ -1363,17 +2131,34 @@ class YTDLPGui(tk.Tk):
         self._load_playlist_titles(url)
 
     def _clear_titles_list(self):
-        # Destroying children alone can leave ttk's cached geometry pointing
-        # at the old (larger) size, so the frame doesn't visually shrink.
-        # Recreating the frame from scratch forces a clean recalculation.
-        parent = self.titles_list_frame.master
-        self.titles_list_frame.destroy()
-        self.titles_list_frame = ttk.Frame(parent, style="Card.TFrame")
-        self.titles_list_frame.pack(fill="x", pady=(8, 0))
+        """Wipe every existing title-row from the bounded titles_list_frame,
+        but keep the frame + its parent canvas intact (they're now permanent
+        widgets, not re-created every time)."""
+        for child in list(self.titles_list_frame.winfo_children()):
+            child.destroy()
         self.video_check_vars = []
         self.video_status_vars = {}
         self.video_size_vars = {}
+        # Reset the inner titles-canvas scroll position so a fresh load starts
+        # from the top of the list, not wherever the user last scrolled to.
+        self.update_idletasks()
+        self.titles_canvas.configure(scrollregion=self.titles_canvas.bbox("all"))
+        self.titles_canvas.yview_moveto(0.0)
         self._sync_scrollregion()
+
+    def _show_titles_placeholder(self, message=None):
+        """Show a friendly placeholder inside the (now empty) titles box so
+        the user knows what to do next."""
+        text = message or (
+            "Playlist URL paste করে '🔄 Load / Refresh Titles' চাপুন —\n"
+            "video titles এখানে checkbox list হিসেবে দেখা যাবে।"
+        )
+        ttk.Label(
+            self.titles_list_frame, text=text,
+            style="Subtle.TLabel", justify="left"
+        ).pack(anchor="w", padx=10, pady=14)
+        self.update_idletasks()
+        self.titles_canvas.configure(scrollregion=self.titles_canvas.bbox("all"))
 
     def _sync_scrollregion(self, reset_scroll=True):
         """Force Tk to recompute geometry right now (not on the next idle
@@ -1551,7 +2336,7 @@ class YTDLPGui(tk.Tk):
             self.titles_status_var.set(f"{total} videos scanned — quality list ready.")
             self._log("Playlist format scan complete.")
 
-
+    def _extract_playlist_titles(self, url, raise_on_error=False):
         """Fetch (idx, title) pairs for every entry in a playlist. Runs
         synchronously -- caller must invoke this from a worker thread.
         Returns [] on failure (or if raise_on_error=True, re-raises)."""
@@ -1596,11 +2381,13 @@ class YTDLPGui(tk.Tk):
 
         if error:
             self._clear_titles_list()
+            self._show_titles_placeholder(f"⚠  {error}")
             self.titles_status_var.set(error)
             self._log(error)
             return
         if not titles:
             self._clear_titles_list()
+            self._show_titles_placeholder("এই URL-এ কোনো playlist video পাওয়া যায়নি।")
             self.titles_status_var.set("No videos found in this playlist.")
             return
 
@@ -1670,6 +2457,11 @@ class YTDLPGui(tk.Tk):
 
         # Sync select_all_var / playlist_items_var with whatever ended up checked above.
         self._on_title_check_changed()
+        # Refresh the inner titles-canvas scrollregion so it can scroll the
+        # newly-added rows (independent of the outer page scroll).
+        self.update_idletasks()
+        self.titles_canvas.configure(scrollregion=self.titles_canvas.bbox("all"))
+        self.titles_canvas.yview_moveto(0.0)
         self._sync_scrollregion()
 
     def _set_all_title_checks(self, value):

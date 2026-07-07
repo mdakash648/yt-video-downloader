@@ -1,18 +1,20 @@
-# UTF-8
+
+Action: file_editor create /app/Version.txt --file-text "# UTF-8
 #
 # PyInstaller version-info resource file.
 # Used with: pyinstaller --version-file version.txt ...
 # This embeds proper file/version metadata into the exe (visible in
 # Windows Explorer -> right-click exe -> Properties -> Details tab).
-# A "blank" exe with no publisher/product/version info tends to look more
+# A \"blank\" exe with no publisher/product/version info tends to look more
 # suspicious to Windows SmartScreen and some antivirus heuristics than one
 # with normal-looking metadata filled in. Edit the values below as you like.
 
 VSVersionInfo(
   ffi=FixedFileInfo(
     # filevers / prodvers: (major, minor, patch, build) - keep 4 numbers
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    # Bumped to 1.1.0.0 - added Direct/M3U downloader tab
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     # Contains a bitmask that specifies the valid bits 'flags'
     mask=0x3f,
     # Contains a bitmask that specifies the Boolean attributes of the file
@@ -25,21 +27,23 @@ VSVersionInfo(
     subtype=0x0,
     # Creation date and time stamp
     date=(0, 0)
-  ),
+    ),
   kids=[
     StringFileInfo(
       [
       StringTable(
         u'040904B0',
         [StringStruct(u'CompanyName', u'Akash'),
-        StringStruct(u'FileDescription', u'YT-DLP Downloader - YouTube video/audio/playlist downloader GUI'),
-        StringStruct(u'FileVersion', u'1.0.0.0'),
+        StringStruct(u'FileDescription', u'YT-DLP Downloader - YouTube, Direct URL & M3U playlist downloader'),
+        StringStruct(u'FileVersion', u'1.1.0.0'),
         StringStruct(u'InternalName', u'YTDLPDownloader'),
         StringStruct(u'LegalCopyright', u'Copyright \u00A9 2026 Akash'),
         StringStruct(u'OriginalFilename', u'YTDLPDownloader.exe'),
         StringStruct(u'ProductName', u'YT-DLP Downloader'),
-        StringStruct(u'ProductVersion', u'1.0.0.0')])
+        StringStruct(u'ProductVersion', u'1.1.0.0')])
       ]),
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
-  ]
+    ]
 )
+"
+Observation: Create successful: /app/Version.txt
