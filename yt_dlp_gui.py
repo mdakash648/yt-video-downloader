@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import json
+import shutil
 import subprocess
 import threading
 import urllib.request
@@ -135,12 +136,20 @@ def build_format_selector(height):
 
 
 def format_filesize(num_bytes):
-    """Human readable filesize, e.g. 512MB or 1.4GB. Returns '' for unknown."""
+    """Human readable filesize with the unit auto-picked from KB/MB/GB
+    (e.g. 150KB, 512MB, 1.4GB) -- bumps to the next unit once the value
+    would round to >= 1024 of the current one, so 1024MB shows as 1GB
+    instead of 1024.0MB. Returns '' for unknown/zero size."""
     if not num_bytes or num_bytes <= 0:
         return ""
-    if num_bytes >= 1024 ** 3:
-        return f"{num_bytes / 1024 ** 3:.2f} GB"
-    return f"{num_bytes / 1024 ** 2:.1f} MB"
+    kb = num_bytes / 1024
+    mb = kb / 1024
+    gb = mb / 1024
+    if gb >= 1 or round(mb, 1) >= 1024:
+        return f"{gb:.2f} GB"
+    if mb >= 1 or round(kb, 0) >= 1024:
+        return f"{mb:.1f} MB"
+    return f"{kb:.0f} KB"
 
 # ---------------- Color palette (modern dark theme) ----------------
 BG_MAIN = "#121417"
@@ -338,6 +347,12 @@ class YTDLPGui(tk.Tk):
             value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
+        # Fast/multi-connection download for direct CDN/ISP-FTP links (Tab 2 only).
+        # These are single continuous files (not HLS/DASH), so speed comes from
+        # opening several parallel range-request connections to the same URL --
+        # exactly what aria2c or yt-dlp's chunked+concurrent native downloader do.
+        self.fast_download_var = tk.BooleanVar(value=False)
+        self.fast_download_connections_var = tk.StringVar(value="16")
         self.m3u_file_path_var = tk.StringVar()
         self.m3u_entries = []          # list of parsed M3U entries (dicts)
         self.m3u_check_vars = []       # [tk.BooleanVar, ...] per entry
@@ -1158,6 +1173,32 @@ class YTDLPGui(tk.Tk):
         )
         self.direct_download_btn.pack(side="left")
 
+        # ---- Section A2: Fast / multi-connection download (Direct URL + M3U) ----
+        fast_outer, fast_inner = self._card(root, "⚡ Fast Download (Multi-connection)")
+        fast_outer.pack(fill="x", pady=(0, 12))
+
+        ttk.Label(fast_inner,
+                  text="ISP/FTP direct video link (M3U entries বা Direct URL) হলে multiple connection দিয়ে "
+                       "parallel এ download করে speed বহুগুণ বাড়ানো যায়। aria2c ইনস্টল থাকলে সেটা ব্যবহার হবে, "
+                       "না থাকলে yt-dlp-এর নিজস্ব concurrent-chunk downloader ব্যবহার হবে।",
+                  style="Subtle.TLabel", wraplength=760, justify="left").pack(anchor="w", pady=(0, 8))
+
+        fast_row = ttk.Frame(fast_inner, style="Card.TFrame")
+        fast_row.pack(fill="x")
+        ttk.Checkbutton(fast_row, text="Fast download মোড চালু করো",
+                         variable=self.fast_download_var, style="TCheckbutton").pack(side="left")
+
+        ttk.Label(fast_row, text="Connections:", style="Subtle.TLabel").pack(side="left", padx=(20, 4))
+        conn_combo = ttk.Combobox(
+            fast_row, textvariable=self.fast_download_connections_var,
+            values=["4", "8", "16", "32"], width=4, state="readonly", style="TCombobox"
+        )
+        conn_combo.pack(side="left")
+
+        self.fast_download_status_var = tk.StringVar(value=self._fast_download_engine_label())
+        ttk.Label(fast_inner, textvariable=self.fast_download_status_var,
+                  style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
+
         # ---- Section B: M3U/M3U8 file loader ----
         m3u_outer, m3u_inner = self._card(root, "M3U / M3U8 Playlist File")
         m3u_outer.pack(fill="x", pady=(0, 12))
@@ -1605,6 +1646,7 @@ class YTDLPGui(tk.Tk):
             "ignoreerrors": False,
             **self._ffmpeg_opt(),
             **self._ratelimit_opt(),
+            **self._fast_download_opt(),
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1750,6 +1792,51 @@ class YTDLPGui(tk.Tk):
         if limit_bytes:
             return {"ratelimit": limit_bytes}
         return {}
+
+    @staticmethod
+    def _aria2c_available():
+        return shutil.which("aria2c") is not None
+
+    def _fast_download_engine_label(self):
+        """Text shown under the Fast Download checkbox saying which engine
+        will actually be used (aria2c if installed, else yt-dlp native)."""
+        if self._aria2c_available():
+            return "✓ aria2c পাওয়া গেছে — চালু করলে aria2c দিয়ে multi-connection download হবে।"
+        return ("ℹ aria2c ইনস্টল নেই — চালু করলে yt-dlp-এর নিজস্ব concurrent-chunk downloader ব্যবহার হবে "
+                "(aria2c ইনস্টল করলে সাধারণত আরও ভালো speed পাওয়া যায়)।")
+
+    def _fast_download_opt(self):
+        """Multi-connection download options for direct CDN/ISP-FTP links
+        (Direct URL + M3U tab only). These are plain, non-fragmented HTTP
+        files, so parallel range-request connections are what actually
+        speeds things up -- equivalent to:
+            yt-dlp --downloader aria2c --downloader-args "aria2c: -x N -s N -k 1M" <URL>
+        or, when aria2c isn't installed, yt-dlp's own native equivalent:
+            yt-dlp --concurrent-fragments N --http-chunk-size 10M --buffer-size 16M <URL>
+        """
+        if not self.fast_download_var.get():
+            return {}
+        try:
+            n = int(self.fast_download_connections_var.get())
+        except (TypeError, ValueError):
+            n = 16
+        n = max(1, min(n, 32))
+
+        if self._aria2c_available():
+            self._log(f"⚡ Fast download: aria2c (-x {n} -s {n} -k 1M)")
+            return {
+                "external_downloader": "aria2c",
+                "external_downloader_args": {
+                    "aria2c": ["-x", str(n), "-s", str(n), "-k", "1M"]
+                },
+            }
+
+        self._log(f"⚡ Fast download: yt-dlp native (concurrent-fragments {n}, chunk 10M, buffer 16M)")
+        return {
+            "concurrent_fragment_downloads": n,
+            "http_chunk_size": 10 * 1024 * 1024,   # 10M — splits the file into range-request chunks
+            "buffersize": 16 * 1024 * 1024,        # 16M
+        }
 
     def _thumbnail_opts(self):
         """Download the video's thumbnail and embed it as poster/cover art in the output file."""
@@ -3261,10 +3348,10 @@ class YTDLPGui(tk.Tk):
                 percent = downloaded / total * 100
                 self.progress["value"] = percent
                 self.percent_var.set(f"{percent:.1f}%")
-                self.filesize_var.set(f"{downloaded / (1024*1024):.1f} / {total / (1024*1024):.1f} MB")
+                self.filesize_var.set(f"{format_filesize(downloaded) or '0 KB'} / {format_filesize(total)}")
                 self.status_var.set(f"Downloading {playlist_tag}{filename}")
             else:
-                self.filesize_var.set(f"{downloaded / (1024*1024):.1f} MB")
+                self.filesize_var.set(format_filesize(downloaded) or "0 KB")
                 self.status_var.set(f"Downloading {playlist_tag}{filename}...")
         elif d["status"] == "finished":
             self.status_var.set(f"Processing {playlist_tag}(merging/converting)...")
