@@ -204,9 +204,10 @@ def format_eta(seconds):
     return f"{m:d}:{s:02d}"
 
 
-def parse_m3u_file(filepath):
+def parse_m3u_text(text):
     """
-    Parse M3U/M3U8 file and extract media entries.
+    Parse M3U/M3U8 playlist content (raw text, from a local file OR fetched
+    from a URL) and extract media entries.
 
     Returns: List of dicts with structure:
     {
@@ -219,11 +220,7 @@ def parse_m3u_file(filepath):
     }
     """
     entries = []
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = [line.rstrip('\r\n') for line in f.readlines()]
-    except Exception as e:
-        raise Exception(f"M3U file পড়তে সমস্যা হয়েছে: {e}")
+    lines = [line.rstrip('\r\n') for line in text.splitlines()]
 
     current_entry = {}
 
@@ -277,6 +274,49 @@ def parse_m3u_file(filepath):
                 current_entry = {}
 
     return entries
+
+
+def parse_m3u_file(filepath):
+    """Read a local M3U/M3U8 file and parse it via parse_m3u_text."""
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    except Exception as e:
+        raise Exception(f"M3U file পড়তে সমস্যা হয়েছে: {e}")
+    return parse_m3u_text(text)
+
+
+def fetch_m3u_from_url(url, timeout=20):
+    """Fetch raw text from an M3U playlist URL. Also works with URLs that
+    aren't a plain .m3u file link but instead an API/page endpoint whose
+    response body IS the M3U-formatted text (e.g. some Vercel-hosted
+    playlist generators) -- we just GET it and check the content looks
+    like M3U, regardless of the URL's extension or Content-Type."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raise Exception(f"HTTP {e.code} error — URL থেকে data আনা যায়নি।")
+    except urllib.error.URLError as e:
+        raise Exception(f"Network error — URL-এ পৌঁছানো যায়নি: {e.reason}")
+    except Exception as e:
+        raise Exception(f"URL fetch ব্যর্থ: {e}")
+
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        text = raw.decode('latin-1', errors='ignore')
+
+    if '#EXTM3U' not in text and '#EXTINF' not in text:
+        raise Exception("এই URL থেকে valid M3U playlist content পাওয়া যায়নি "
+                         "(কোনো #EXTM3U / #EXTINF tag খুঁজে পাওয়া যায়নি)।")
+
+    return text
 
 
 def sanitize_folder_name(name):
@@ -354,6 +394,7 @@ class YTDLPGui(tk.Tk):
         self.fast_download_var = tk.BooleanVar(value=False)
         self.fast_download_connections_var = tk.StringVar(value="16")
         self.m3u_file_path_var = tk.StringVar()
+        self.m3u_url_var = tk.StringVar()
         self.m3u_entries = []          # list of parsed M3U entries (dicts)
         self.m3u_check_vars = []       # [tk.BooleanVar, ...] per entry
         self.m3u_status_vars = {}      # idx -> tk.StringVar for status icon
@@ -1208,8 +1249,28 @@ class YTDLPGui(tk.Tk):
                        "group auto detect হবে।",
                   style="Subtle.TLabel", wraplength=760, justify="left").pack(anchor="w", pady=(0, 8))
 
+        # ---- Load from online URL (e.g. raw GitHub .m3u link, or a page/API
+        # endpoint whose response body is the M3U content itself) ----
+        ttk.Label(m3u_inner, text="Online M3U URL", style="Subtle.TLabel").pack(anchor="w")
+        m3u_url_row = ttk.Frame(m3u_inner, style="Card.TFrame")
+        m3u_url_row.pack(fill="x", pady=(4, 4))
+        ttk.Entry(m3u_url_row, textvariable=self.m3u_url_var, style="TEntry").pack(
+            side="left", fill="x", expand=True, ipady=3
+        )
+        ttk.Button(m3u_url_row, text="📋 Paste", style="Ghost.TButton",
+                   command=lambda: self._paste_into_var(self.m3u_url_var)).pack(side="left", padx=(6, 0))
+        self.m3u_url_load_btn = ttk.Button(m3u_url_row, text="🌐 Load from URL", style="Accent.TButton",
+                                            command=self._load_m3u_from_url)
+        self.m3u_url_load_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(m3u_inner,
+                  text="e.g. https://raw.githubusercontent.com/user/repo/main/playlist.m3u  বা  "
+                       "https://your-m3u-generator.vercel.app/  (এমন URL-ও কাজ করবে যেটা একটা "
+                       "page/API — hit করলে response-এই M3U content থাকে)।",
+                  style="Subtle.TLabel", wraplength=760, justify="left").pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(m3u_inner, text="অথবা — Local M3U ফাইল", style="Subtle.TLabel").pack(anchor="w")
         m3u_file_row = ttk.Frame(m3u_inner, style="Card.TFrame")
-        m3u_file_row.pack(fill="x", pady=(0, 8))
+        m3u_file_row.pack(fill="x", pady=(4, 8))
         ttk.Entry(m3u_file_row, textvariable=self.m3u_file_path_var, style="TEntry",
                   state="readonly").pack(side="left", fill="x", expand=True, ipady=3)
         ttk.Button(m3u_file_row, text="📂 Browse M3U", style="Ghost.TButton",
@@ -1398,7 +1459,7 @@ class YTDLPGui(tk.Tk):
             self.m3u_file_path_var.set(filepath)
 
     def _parse_m3u(self):
-        """Parse the loaded M3U file and populate the Treeview."""
+        """Parse the loaded local M3U file and populate the Treeview."""
         filepath = self.m3u_file_path_var.get().strip()
         if not filepath or not os.path.isfile(filepath):
             messagebox.showwarning("No file", "প্রথমে একটি M3U/M3U8 ফাইল select করুন।")
@@ -1411,8 +1472,51 @@ class YTDLPGui(tk.Tk):
             messagebox.showerror("Parse Error", str(e))
             return
 
+        self._populate_m3u_entries(entries, source_desc=f"local file: {os.path.basename(filepath)}")
+
+    def _load_m3u_from_url(self):
+        """Fetch an M3U playlist from an online URL (a raw .m3u link, or a
+        page/API endpoint whose response body is M3U content) and parse it.
+        Runs the network fetch in a background thread so the UI doesn't freeze."""
+        url = self.m3u_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("No URL", "একটি M3U playlist URL দিন।")
+            return
+        if not (url.startswith("http://") or url.startswith("https://")):
+            messagebox.showwarning("Invalid URL", "http:// বা https:// দিয়ে শুরু হওয়া একটি URL দিন।")
+            return
+
+        self.m3u_url_load_btn.config(state="disabled")
+        self.m3u_status_label_var.set("⏳ URL থেকে playlist fetch করা হচ্ছে...")
+        self._log(f"M3U: fetching playlist from URL — {url}")
+
+        def worker():
+            try:
+                text = fetch_m3u_from_url(url)
+                entries = parse_m3u_text(text)
+            except Exception as e:
+                self.after(0, lambda: self._on_m3u_url_load_error(str(e)))
+                return
+            self.after(0, lambda: self._on_m3u_url_load_success(entries, url))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_m3u_url_load_error(self, msg):
+        self.m3u_url_load_btn.config(state="normal")
+        self.m3u_status_label_var.set(f"❌ URL থেকে load ব্যর্থ: {msg}")
+        self._log(f"M3U: URL fetch failed — {msg}")
+        messagebox.showerror("Load Error", msg)
+
+    def _on_m3u_url_load_success(self, entries, url):
+        self.m3u_url_load_btn.config(state="normal")
+        self.m3u_file_path_var.set("")  # clear local-file indicator; source is now this URL
+        self._populate_m3u_entries(entries, source_desc=f"URL: {url}")
+
+    def _populate_m3u_entries(self, entries, source_desc=""):
+        """Shared by both local-file Parse and Load-from-URL: resets M3U
+        state, fills the Treeview, and (re)builds the group filter list."""
         if not entries:
-            self.m3u_status_label_var.set("⚠ কোনো media entry পাওয়া যায়নি M3U ফাইলে।")
+            self.m3u_status_label_var.set("⚠ কোনো media entry পাওয়া যায়নি।")
             return
 
         # Reset state
@@ -1441,7 +1545,7 @@ class YTDLPGui(tk.Tk):
         self.m3u_status_label_var.set(
             f"✓ {len(entries)}টি entry parse হয়েছে। Groups: {', '.join(groups)}"
         )
-        self._log(f"M3U parsed: {len(entries)} entries, groups = {groups}")
+        self._log(f"M3U parsed ({source_desc}): {len(entries)} entries, groups = {groups}")
 
         # Populate the group filter list. Only show it when there's more
         # than one group — with a single group, filtering by group is
