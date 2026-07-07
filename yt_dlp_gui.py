@@ -3145,10 +3145,18 @@ class YTDLPGui(tk.Tk):
         self._log("Stop requested. It will halt after the current step.")
 
     def _progress_hook(self, d):
+        # IMPORTANT: use DownloadCancelled (not DownloadError) here.
+        # ydl_opts has "ignoreerrors": True so a single bad video in a
+        # playlist doesn't kill the whole queue -- but that also means
+        # a plain DownloadError raised here gets swallowed per-entry by
+        # yt-dlp, which then just moves on and starts the NEXT playlist
+        # video (creating more .part/.webp files) instead of stopping.
+        # DownloadCancelled is explicitly exempted from ignoreerrors
+        # handling in yt-dlp, so it aborts the whole queue immediately.
         if self.stop_flag:
-            raise yt_dlp.utils.DownloadError("Cancelled by user")
+            raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
         if self.pause_flag:
-            raise yt_dlp.utils.DownloadError("Paused by user")
+            raise yt_dlp.utils.DownloadCancelled("Paused by user")
 
         info = d.get("info_dict", {}) or {}
         pl_index = d.get("playlist_index") or info.get("playlist_index")
