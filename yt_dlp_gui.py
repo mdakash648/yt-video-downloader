@@ -32,6 +32,7 @@ Run:
 
 import os
 import re
+import datetime
 import sys
 import json
 import shutil
@@ -66,6 +67,7 @@ YOUTUBE_URL_RE = re.compile(
 # Config file used to remember the last download location between sessions.
 # Stored in the user's home folder so it persists across app updates.
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".ytdlp_gui_config.json")
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".ytdlp_gui_history.json")
 
 
 def _bundle_base_dirs():
@@ -364,6 +366,9 @@ class YTDLPGui(tk.Tk):
         self.browser_var = tk.StringVar(value="None")
         self.speed_limit_value_var = tk.StringVar(value="")  # plain number, e.g. "5"
         self.speed_limit_unit_var = tk.StringVar(value="MB/s")  # KB/s or MB/s
+        self.schedule_enabled_var = tk.BooleanVar(value=False)
+        self.schedule_time_var = tk.StringVar(value=datetime.datetime.now().strftime("%H:%M"))
+        self.auto_shutdown_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Idle")
         self.percent_var = tk.StringVar(value="0%")
         self.speed_var = tk.StringVar(value="-- KB/s")
@@ -472,6 +477,115 @@ class YTDLPGui(tk.Tk):
                 json.dump({"last_download_dir": self.download_dir.get().strip()}, f)
         except OSError:
             pass
+
+    def _save_to_history(self, title, url, filepath):
+        """Append a successful download record to the history JSON file."""
+        if not title or not url:
+            return
+        new_entry = {
+            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "title": title,
+            "url": url,
+            "path": filepath or ""
+        }
+        try:
+            history = []
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            # Safety net: don't log an exact repeat (same url + path) of the
+            # most recent entry -- guards against any duplicate call site
+            # writing the same completed download twice.
+            if history:
+                last = history[-1]
+                if last.get("url") == new_entry["url"] and last.get("path") == new_entry["path"]:
+                    return
+            history.append(new_entry)
+            # Keep only the last 500 entries to avoid bloating
+            if len(history) > 500:
+                history = history[-500:]
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            self._log(f"History save failed: {e}")
+
+    def _load_history(self):
+        """Populate the history Treeview from the JSON file."""
+        if not hasattr(self, "history_tree"):
+            return
+        for iid in self.history_tree.get_children():
+            self.history_tree.delete(iid)
+        try:
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+                for entry in reversed(history):
+                    self.history_tree.insert(
+                        "", "end",
+                        values=(entry.get("date"), entry.get("title"), entry.get("path"))
+                    )
+        except Exception as e:
+            self._log(f"History load failed: {e}")
+
+    def _clear_history(self):
+        """Delete history file and clear the Treeview."""
+        if not messagebox.askyesno("Clear History", "আপনি কি নিশ্চিতভাবে সব হিস্টোরি মুছে ফেলতে চান?"):
+            return
+        try:
+            if os.path.exists(HISTORY_FILE):
+                os.remove(HISTORY_FILE)
+            for iid in self.history_tree.get_children():
+                self.history_tree.delete(iid)
+            self._log("History cleared.")
+        except Exception as e:
+            self._log(f"History clear failed: {e}")
+
+    def _on_history_open_file(self):
+        selected = self.history_tree.selection()
+        if not selected:
+            messagebox.showinfo("No selection", "প্রথমে একটি লিস্ট আইটেম সিলেক্ট করুন।")
+            return
+        item = self.history_tree.item(selected[0])
+        path = item["values"][2]
+        self._open_file(path)
+
+    def _on_history_open_folder(self):
+        selected = self.history_tree.selection()
+        if not selected:
+            messagebox.showinfo("No selection", "প্রথমে একটি লিস্ট আইটেম সিলেক্ট করুন।")
+            return
+        item = self.history_tree.item(selected[0])
+        path = item["values"][2]
+        self._open_folder(os.path.dirname(path) if os.path.isfile(path) else path)
+
+    def _get_delay_ms(self):
+        """Calculate milliseconds until the scheduled download time."""
+        try:
+            target_str = self.schedule_time_var.get().strip()
+            target_time = datetime.datetime.strptime(target_str, "%H:%M").time()
+            now = datetime.datetime.now()
+            target_dt = datetime.datetime.combine(now.date(), target_time)
+            if target_dt <= now:
+                target_dt += datetime.timedelta(days=1)
+            delta = target_dt - now
+            return int(delta.total_seconds() * 1000)
+        except Exception as e:
+            self._log(f"Schedule time parse error: {e}")
+            return 0
+
+    def _maybe_auto_shutdown(self):
+        """Perform OS shutdown if auto-shutdown is enabled and we are not in batch mode (or at end of batch)."""
+        if self.auto_shutdown_var.get():
+            self._log("Auto-shutdown enabled. PC will shutdown in 10 seconds...")
+            self.after(10000, self._auto_shutdown)
+
+    def _auto_shutdown(self):
+        """Execute platform-specific shutdown command."""
+        self._log("Shutting down PC...")
+        if os.name == "nt":
+            os.system("shutdown /s /t 1")
+        else:
+            os.system("shutdown -h now")
 
     # ---------------- yt-dlp self-update check ----------------
     @staticmethod
@@ -965,7 +1079,15 @@ class YTDLPGui(tk.Tk):
                          command=self._toggle_quality_state).pack(anchor="w", pady=(0, 6))
 
         ttk.Checkbutton(opt_inner, text="🖼 Embed video thumbnail as poster/cover art",
-                         variable=self.embed_thumbnail_var).pack(anchor="w", pady=(0, 10))
+                         variable=self.embed_thumbnail_var).pack(anchor="w", pady=(0, 6))
+
+        sched_row = ttk.Frame(opt_inner, style="Card.TFrame")
+        sched_row.pack(fill="x", pady=(0, 6))
+        ttk.Checkbutton(sched_row, text="🕒 Scheduled Download:", variable=self.schedule_enabled_var).pack(side="left")
+        ttk.Entry(sched_row, textvariable=self.schedule_time_var, width=8, style="TEntry").pack(side="left", padx=(10, 0))
+        ttk.Label(sched_row, text="(HH:MM)", style="Subtle.TLabel").pack(side="left", padx=(5, 0))
+
+        ttk.Checkbutton(opt_inner, text="🔌 Shutdown PC when finished", variable=self.auto_shutdown_var).pack(anchor="w", pady=(0, 10))
 
         grid = ttk.Frame(opt_inner, style="Card.TFrame")
         grid.pack(fill="x")
@@ -1162,8 +1284,13 @@ class YTDLPGui(tk.Tk):
         self.notebook.add(tab2, text="  🔗  Direct URL / M3U Downloader  ")
         self._build_tab2(tab2)
 
+        # ===== TAB 3: Download History =====
+        tab3 = ttk.Frame(self.notebook, style="Main.TFrame")
+        self.notebook.add(tab3, text="  📜  History  ")
+        self._build_history_tab(tab3)
+
         # Register both canvases for mousewheel routing (see _on_mousewheel_global)
-        self._tab_canvases = [self.canvas, self.tab2_canvas]
+        self._tab_canvases = [self.canvas, self.tab2_canvas, self.history_canvas]
 
         # Bind mousewheel ONCE globally, routed to the active tab's canvas.
         # (Previous versions used self.canvas.bind_all which broke after adding
@@ -1172,6 +1299,70 @@ class YTDLPGui(tk.Tk):
         self.bind_all("<MouseWheel>", self._on_mousewheel_global)
         self.bind_all("<Button-4>", self._on_mousewheel_global)
         self.bind_all("<Button-5>", self._on_mousewheel_global)
+
+    # ================================================================
+    # TAB 3: DOWNLOAD HISTORY
+    # ================================================================
+    def _build_history_tab(self, parent):
+        """Build the content of Tab 3 (Download History)."""
+        self.history_canvas = tk.Canvas(parent, bg=BG_MAIN, highlightthickness=0, bd=0)
+        vscroll3 = ttk.Scrollbar(parent, orient="vertical", command=self.history_canvas.yview)
+        self.history_canvas.configure(yscrollcommand=vscroll3.set)
+        self.history_canvas.pack(side="left", fill="both", expand=True)
+        vscroll3.pack(side="right", fill="y")
+
+        root = ttk.Frame(self.history_canvas, style="Main.TFrame")
+        self._history_canvas_window = self.history_canvas.create_window((0, 0), window=root, anchor="nw")
+
+        def _on_frame_configure(event=None):
+            self.history_canvas.configure(scrollregion=self.history_canvas.bbox("all"))
+        def _on_canvas_configure(event):
+            self.history_canvas.itemconfig(self._history_canvas_window, width=event.width)
+
+        root.bind("<Configure>", _on_frame_configure)
+        self.history_canvas.bind("<Configure>", _on_canvas_configure)
+        root.configure(padding=(18, 12))
+
+        hist_outer, hist_inner = self._card(root, "Download History")
+        hist_outer.pack(fill="both", expand=True, pady=(0, 12))
+
+        # Action buttons
+        btn_row = ttk.Frame(hist_inner, style="Card.TFrame")
+        btn_row.pack(fill="x", pady=(0, 10))
+        ttk.Button(btn_row, text="🔄 Refresh", style="Ghost.TButton", command=self._load_history).pack(side="left")
+        ttk.Button(btn_row, text="🗑 Clear History", style="Stop.TButton", command=self._clear_history).pack(side="left", padx=(10, 0))
+
+        # History Treeview
+        tree_wrap = tk.Frame(hist_inner, bg=BG_INPUT, highlightbackground=BORDER, highlightthickness=1)
+        tree_wrap.pack(fill="both", expand=True)
+
+        self.history_tree = ttk.Treeview(
+            tree_wrap,
+            columns=("date", "title", "path"),
+            show="headings",
+            height=20,
+            selectmode="browse"
+        )
+        self.history_tree.heading("date", text="Date")
+        self.history_tree.heading("title", text="Title")
+        self.history_tree.heading("path", text="Local Path")
+
+        self.history_tree.column("date", width=140, anchor="w", stretch=False)
+        self.history_tree.column("title", width=300, anchor="w", stretch=True)
+        self.history_tree.column("path", width=300, anchor="w", stretch=True)
+
+        h_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=h_scroll.set)
+        self.history_tree.pack(side="left", fill="both", expand=True)
+        h_scroll.pack(side="right", fill="y")
+
+        # Bottom buttons for selected item
+        action_row = ttk.Frame(hist_inner, style="Card.TFrame")
+        action_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(action_row, text="▶ Play File", style="Accent.TButton", command=self._on_history_open_file).pack(side="left")
+        ttk.Button(action_row, text="📁 Open Folder", style="Ghost.TButton", command=self._on_history_open_folder).pack(side="left", padx=(10, 0))
+
+        self._load_history()
 
     # ================================================================
     # TAB 2: DIRECT URL / M3U DOWNLOADER
@@ -1252,6 +1443,9 @@ class YTDLPGui(tk.Tk):
         fast_row.pack(fill="x")
         ttk.Checkbutton(fast_row, text="Fast download মোড চালু করো",
                          variable=self.fast_download_var, style="TCheckbutton").pack(side="left")
+
+        ttk.Checkbutton(fast_row, text="🔌 Auto Shutdown",
+                         variable=self.auto_shutdown_var, style="TCheckbutton").pack(side="left", padx=(15, 0))
 
         ttk.Label(fast_row, text="Connections:", style="Subtle.TLabel").pack(side="left", padx=(20, 4))
         conn_combo = ttk.Combobox(
@@ -1543,6 +1737,24 @@ class YTDLPGui(tk.Tk):
             self.m3u_status_label_var.set("⚠ কোনো media entry পাওয়া যায়নি।")
             return
 
+        # De-duplicate entries that share the same media URL. Some source
+        # playlists (e.g. auto-generated ones) end up with the same URL
+        # listed multiple times, which previously caused the same file to
+        # be downloaded/logged over and over (duplicate History rows).
+        # Keep the first occurrence of each URL, in original order.
+        original_count = len(entries)
+        seen_urls = set()
+        deduped = []
+        for entry in entries:
+            key = (entry.get('url') or "").strip().lower()
+            if key and key in seen_urls:
+                continue
+            if key:
+                seen_urls.add(key)
+            deduped.append(entry)
+        entries = deduped
+        duplicates_removed = original_count - len(entries)
+
         # Reset state
         self.m3u_entries = entries
         self.m3u_check_vars = [tk.BooleanVar(value=True) for _ in entries]
@@ -1566,10 +1778,15 @@ class YTDLPGui(tk.Tk):
             )
 
         groups = sorted(set((e.get('group') or 'Default') for e in entries))
+        dup_note = f" ({duplicates_removed}টি duplicate বাদ দেওয়া হয়েছে)" if duplicates_removed else ""
         self.m3u_status_label_var.set(
-            f"✓ {len(entries)}টি entry parse হয়েছে। Groups: {', '.join(groups)}"
+            f"✓ {len(entries)}টি entry parse হয়েছে{dup_note}। Groups: {', '.join(groups)}"
         )
-        self._log(f"M3U parsed ({source_desc}): {len(entries)} entries, groups = {groups}")
+        self._log(
+            f"M3U parsed ({source_desc}): {len(entries)} entries"
+            + (f", {duplicates_removed} duplicate URL(s) skipped" if duplicates_removed else "")
+            + f", groups = {groups}"
+        )
 
         # Populate the group filter list. Only show it when there's more
         # than one group — with a single group, filtering by group is
@@ -1661,6 +1878,19 @@ class YTDLPGui(tk.Tk):
             messagebox.showerror("Missing dependency",
                                  "Please install yt-dlp first:\n\npip install yt-dlp")
             return
+
+        if self.schedule_enabled_var.get():
+            delay = self._get_delay_ms()
+            if delay > 0:
+                self.status_var.set(f"Scheduled: starts in {delay//1000}s")
+                self._log(f"Direct download scheduled at {self.schedule_time_var.get()}. Waiting...")
+                self.direct_download_btn.config(state="disabled")
+                self.after(delay, self._start_direct_download_actual)
+                return
+
+        self._start_direct_download_actual()
+
+    def _start_direct_download_actual(self):
         url = self.direct_url_var.get().strip()
         referer = self.direct_referer_var.get().strip()
         if not url:
@@ -1714,6 +1944,7 @@ class YTDLPGui(tk.Tk):
                 self.speed_var.set("-- KB/s")
                 self.eta_var.set("ETA --:--")
                 self._log("[Direct] ✅ Download completed.")
+                self._save_to_history(os.path.basename(self._current_output_file or "Direct Download"), url, self._current_output_file)
                 is_playlist = False
                 output_file = self._current_output_file
                 self.after(0, lambda: self._show_completion_modal(is_playlist, output_file, out_dir))
@@ -1910,6 +2141,7 @@ class YTDLPGui(tk.Tk):
                     status_var.set("✅")
                 self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "✅"))
                 self._log(f"[M3U {i}/{total}] ✅ Done: {title}")
+                self._save_to_history(title, entry['url'], self._current_output_file)
             except Exception as e:
                 if self.stop_flag:
                     self.after(0, lambda i=idx: self._m3u_update_tree_status(i, "⏳"))
@@ -3010,6 +3242,18 @@ class YTDLPGui(tk.Tk):
             messagebox.showerror("Missing dependency", "Please install yt-dlp first:\n\npip install yt-dlp")
             return
 
+        if self.schedule_enabled_var.get():
+            delay = self._get_delay_ms()
+            if delay > 0:
+                self.status_var.set(f"Scheduled: starts in {delay//1000}s")
+                self._log(f"Download scheduled at {self.schedule_time_var.get()}. Waiting...")
+                self.download_btn.config(state="disabled")
+                self.after(delay, self._start_download_actual)
+                return
+
+        self._start_download_actual()
+
+    def _start_download_actual(self):
         if self.batch_mode_var.get():
             self._start_batch_download()
             return
@@ -3643,6 +3887,9 @@ class YTDLPGui(tk.Tk):
             filepath = info.get("filepath") or info.get("_filename")
             if filepath:
                 self._current_output_file = filepath
+                title = info.get("title") or os.path.basename(filepath)
+                url = info.get("webpage_url") or info.get("url") or "N/A"
+                self._save_to_history(title, url, filepath)
 
     def _run_download(self, url, out_dir):
         try:
