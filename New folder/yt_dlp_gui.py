@@ -35,7 +35,6 @@ import re
 import sys
 import json
 import shutil
-import socket
 import subprocess
 import threading
 import urllib.request
@@ -95,23 +94,7 @@ def find_bundled_ffmpeg():
     return None
 
 
-def find_bundled_aria2c():
-    """Look for a bundled aria2c binary (project\\aria2c\\aria2c.exe) so users
-    never need aria2c installed / on their system PATH. Returns the FULL
-    PATH to the exe (not just the folder), or None if not found -- in
-    which case we fall back to a plain PATH lookup."""
-    exe_name = "aria2c.exe" if os.name == "nt" else "aria2c"
-    for base in _bundle_base_dirs():
-        for sub in ("", "aria2c", "bin"):
-            folder = os.path.join(base, sub) if sub else base
-            candidate = os.path.join(folder, exe_name)
-            if os.path.isfile(candidate):
-                return candidate
-    return None
-
-
 FFMPEG_DIR = find_bundled_ffmpeg()
-ARIA2C_PATH = find_bundled_aria2c()
 
 
 BEST_AVAILABLE_LABEL = "Best available"
@@ -386,7 +369,6 @@ class YTDLPGui(tk.Tk):
         self._paused_context = None  # {"url":..., "out_dir":...} saved when paused, for Resume
         self.video_status_vars = {}  # idx -> tk.StringVar() holding the status icon per playlist row
         self._current_downloading_idx = None  # playlist index currently being downloaded (for pause/resume)
-        self._current_aria2c_rpc_port = None  # set by _fast_download_opt() when aria2c is in use
 
         # ---- Dynamic format detection / size estimate state ----
         self.video_size_vars = {}  # idx -> tk.StringVar() with per-video "720p · ≈120 MB" label
@@ -442,12 +424,6 @@ class YTDLPGui(tk.Tk):
             self._log(f"ffmpeg found: {FFMPEG_DIR}")
         else:
             self._log("ffmpeg not found (only needed for merging/MP3 conversion; "
-                       "packaged .exe builds bundle it automatically).")
-
-        if ARIA2C_PATH:
-            self._log(f"aria2c found: {ARIA2C_PATH}")
-        else:
-            self._log("aria2c not found (optional, only needed for Fast Download; "
                        "packaged .exe builds bundle it automatically).")
 
         # Auto-check for a newer yt-dlp version shortly after opening (quiet
@@ -1799,28 +1775,8 @@ class YTDLPGui(tk.Tk):
             **self._fast_download_opt(),
         }
 
-        # _fast_download_opt() sets this when aria2c (with its RPC interface
-        # enabled) is the downloader for this file -- start a background
-        # poller so the progress bar / speed / ETA / size boxes actually
-        # update during Fast Download (see _poll_aria2c_progress docstring).
-        aria2c_port = self._current_aria2c_rpc_port
-        poll_thread = None
-        stop_poll = threading.Event()
-        if aria2c_port:
-            poll_thread = threading.Thread(
-                target=self._poll_aria2c_progress,
-                args=(aria2c_port, stop_poll),
-                daemon=True,
-            )
-            poll_thread.start()
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        finally:
-            if poll_thread:
-                stop_poll.set()
-                poll_thread.join(timeout=2)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
     # ---------------- Tab 2: M3U batch download ----------------
     def _start_m3u_batch_download(self):
@@ -1965,26 +1921,15 @@ class YTDLPGui(tk.Tk):
 
     @staticmethod
     def _aria2c_available():
-        # Prefer the bundled aria2c\aria2c.exe next to the app; fall back to
-        # a system PATH lookup only if no bundled copy was found (e.g. when
-        # running yt_dlp_gui.py directly from source without the aria2c\ folder).
-        return ARIA2C_PATH is not None or shutil.which("aria2c") is not None
+        return shutil.which("aria2c") is not None
 
     def _fast_download_engine_label(self):
         """Text shown under the Fast Download checkbox saying which engine
-        will actually be used (aria2c if available, else yt-dlp native)."""
+        will actually be used (aria2c if installed, else yt-dlp native)."""
         if self._aria2c_available():
             return "✓ aria2c পাওয়া গেছে — চালু করলে aria2c দিয়ে multi-connection download হবে।"
-        return ("ℹ aria2c পাওয়া যায়নি — চালু করলে yt-dlp-এর নিজস্ব concurrent-chunk downloader ব্যবহার হবে "
-                "(aria2c থাকলে সাধারণত আরও ভালো speed পাওয়া যায়)।")
-
-    @staticmethod
-    def _pick_free_port():
-        """Ask the OS for a free local TCP port (bind to port 0, read it
-        back, then release it) -- used for aria2c's RPC listener."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
+        return ("ℹ aria2c ইনস্টল নেই — চালু করলে yt-dlp-এর নিজস্ব concurrent-chunk downloader ব্যবহার হবে "
+                "(aria2c ইনস্টল করলে সাধারণত আরও ভালো speed পাওয়া যায়)।")
 
     def _fast_download_opt(self):
         """Multi-connection download options for direct CDN/ISP-FTP links
@@ -1992,20 +1937,9 @@ class YTDLPGui(tk.Tk):
         files, so parallel range-request connections are what actually
         speeds things up -- equivalent to:
             yt-dlp --downloader aria2c --downloader-args "aria2c: -x N -s N -k 1M" <URL>
-        or, when aria2c isn't available, yt-dlp's own native equivalent:
+        or, when aria2c isn't installed, yt-dlp's own native equivalent:
             yt-dlp --concurrent-fragments N --http-chunk-size 10M --buffer-size 16M <URL>
-
-        NOTE on progress: when yt-dlp hands a download off to an external
-        downloader like aria2c, it does NOT get live progress back from it
-        (no speed/eta/downloaded-bytes updates -- yt-dlp only finds out once
-        the whole file is done). So aria2c is started with its own RPC
-        interface enabled on a free local port, and _poll_aria2c_progress()
-        polls that RPC endpoint in a background thread and feeds the numbers
-        into the same _progress_hook() the native downloader uses, which is
-        what actually keeps the progress bar / speed / ETA / size boxes
-        updating during Fast Download.
         """
-        self._current_aria2c_rpc_port = None
         if not self.fast_download_var.get():
             return {}
         try:
@@ -2015,23 +1949,11 @@ class YTDLPGui(tk.Tk):
         n = max(1, min(n, 32))
 
         if self._aria2c_available():
-            # Use the full path to the bundled aria2c.exe when we have one, so
-            # this works even though we tell users NOT to add aria2c to PATH.
-            # yt-dlp accepts either a bare name (PATH lookup) or a full path here.
-            aria2c_exe = ARIA2C_PATH or "aria2c"
-            rpc_port = self._pick_free_port()
-            self._current_aria2c_rpc_port = rpc_port
-            self._log(f"⚡ Fast download: aria2c (-x {n} -s {n} -k 1M) [{aria2c_exe}]")
+            self._log(f"⚡ Fast download: aria2c (-x {n} -s {n} -k 1M)")
             return {
-                "external_downloader": aria2c_exe,
+                "external_downloader": "aria2c",
                 "external_downloader_args": {
-                    "aria2c": [
-                        "-x", str(n), "-s", str(n), "-k", "1M",
-                        # Local-only RPC so we can poll real progress (see note above).
-                        "--enable-rpc=true",
-                        f"--rpc-listen-port={rpc_port}",
-                        "--rpc-listen-all=false",
-                    ]
+                    "aria2c": ["-x", str(n), "-s", str(n), "-k", "1M"]
                 },
             }
 
@@ -2041,73 +1963,6 @@ class YTDLPGui(tk.Tk):
             "http_chunk_size": 10 * 1024 * 1024,   # 10M — splits the file into range-request chunks
             "buffersize": 16 * 1024 * 1024,        # 16M
         }
-
-    def _aria2c_rpc_call(self, port, method, params=None):
-        """Minimal JSON-RPC 2.0 client for aria2c's local RPC interface
-        (stdlib-only, no extra dependency needed)."""
-        payload = json.dumps({
-            "jsonrpc": "2.0", "id": "ytdlpgui",
-            "method": method, "params": params or [],
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/jsonrpc",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-    def _poll_aria2c_progress(self, port, stop_event):
-        """Runs in a background thread for the lifetime of one aria2c
-        download. yt-dlp's progress_hooks stay silent while an external
-        downloader is running (see _fast_download_opt's docstring), so this
-        polls aria2c's own RPC endpoint every ~0.3s instead and pushes the
-        numbers into _progress_hook() -- the same function the native
-        downloader uses -- so the progress bar / speed / ETA / size boxes
-        keep updating during Fast Download too.
-
-        It also watches self.stop_flag. aria2c runs as its own separate OS
-        process (not inside yt-dlp's normal download loop), so just raising
-        DownloadCancelled from _progress_hook -- which is what stops the
-        native downloader -- does nothing to it; aria2c would keep
-        downloading in the background even after the UI says "Stopped".
-        So when Stop is clicked, this sends aria2c a forceShutdown command
-        over the same RPC connection, which actually kills it.
-        """
-        keys = ["totalLength", "completedLength", "downloadSpeed", "files"]
-        shutdown_sent = False
-        while not stop_event.is_set():
-            if self.stop_flag and not shutdown_sent:
-                try:
-                    self._aria2c_rpc_call(port, "aria2.forceShutdown")
-                    shutdown_sent = True
-                    self._log("⏹ Fast download (aria2c) বন্ধ করা হচ্ছে...")
-                except Exception:
-                    pass  # RPC may not be up yet -- retry on the next loop tick
-            try:
-                result = self._aria2c_rpc_call(port, "aria2.tellActive", [keys])
-                active = result.get("result") or []
-                if active:
-                    d = active[0]
-                    total = int(d.get("totalLength") or 0)
-                    downloaded = int(d.get("completedLength") or 0)
-                    speed = int(d.get("downloadSpeed") or 0)
-                    eta = int((total - downloaded) / speed) if speed and total else None
-                    filename = ""
-                    files = d.get("files") or []
-                    if files:
-                        filename = os.path.basename(files[0].get("path", ""))
-                    self._progress_hook({
-                        "status": "downloading",
-                        "total_bytes": total or None,
-                        "downloaded_bytes": downloaded,
-                        "speed": speed or None,
-                        "eta": eta,
-                        "filename": filename,
-                    })
-            except Exception:
-                pass  # RPC not up yet / already torn down -- just retry or exit
-            stop_event.wait(0.3)
 
     def _thumbnail_opts(self):
         """Download the video's thumbnail and embed it as poster/cover art in the output file."""
