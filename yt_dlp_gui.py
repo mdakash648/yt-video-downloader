@@ -478,15 +478,33 @@ class YTDLPGui(tk.Tk):
         except OSError:
             pass
 
+    @staticmethod
+    def _format_size(num_bytes):
+        """Human-readable file size, e.g. 512 -> '512 B', 15400000 -> '14.7 MB'."""
+        if not num_bytes or num_bytes <= 0:
+            return "--"
+        size = float(num_bytes)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{int(size)} {unit}" if unit == "B" else f"{size:.2f} {unit}"
+            size /= 1024
+
     def _save_to_history(self, title, url, filepath):
         """Append a successful download record to the history JSON file."""
         if not title or not url:
             return
+        size_bytes = 0
+        try:
+            if filepath and os.path.exists(filepath):
+                size_bytes = os.path.getsize(filepath)
+        except Exception:
+            size_bytes = 0
         new_entry = {
             "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "title": title,
             "url": url,
-            "path": filepath or ""
+            "path": filepath or "",
+            "size_bytes": size_bytes,
         }
         try:
             history = []
@@ -510,22 +528,70 @@ class YTDLPGui(tk.Tk):
             self._log(f"History save failed: {e}")
 
     def _load_history(self):
-        """Populate the history Treeview from the JSON file."""
+        """Load the history JSON file into memory, then render the tree
+        using the currently active sort column/direction."""
         if not hasattr(self, "history_tree"):
             return
-        for iid in self.history_tree.get_children():
-            self.history_tree.delete(iid)
+        self._history_cache = []
         try:
             if os.path.exists(HISTORY_FILE):
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-                for entry in reversed(history):
-                    self.history_tree.insert(
-                        "", "end",
-                        values=(entry.get("date"), entry.get("title"), entry.get("path"))
-                    )
+                    self._history_cache = json.load(f)
         except Exception as e:
             self._log(f"History load failed: {e}")
+        self._render_history_tree()
+
+    def _sort_history_by(self, col):
+        """IDM-style header click: sort by that column, flipping direction
+        if the same column is clicked again."""
+        if self._history_sort_col == col:
+            self._history_sort_reverse = not self._history_sort_reverse
+        else:
+            self._history_sort_col = col
+            # Sensible default direction per column: newest date / largest
+            # size first, but titles/paths A-Z first.
+            self._history_sort_reverse = col in ("date", "size")
+        self._render_history_tree()
+
+    def _render_history_tree(self):
+        """Sort self._history_cache per the active column/direction and
+        repopulate the Treeview, including the # row numbers, zebra
+        striping, and ▲/▼ sort-arrow on the active column header."""
+        if not hasattr(self, "history_tree"):
+            return
+
+        col = self._history_sort_col
+        reverse = self._history_sort_reverse
+
+        def sort_key(entry):
+            if col == "size":
+                return entry.get("size_bytes") or 0
+            if col == "title":
+                return (entry.get("title") or "").lower()
+            if col == "path":
+                return (entry.get("path") or "").lower()
+            return entry.get("date") or ""  # ISO-like format sorts correctly as a string
+
+        rows = sorted(self._history_cache, key=sort_key, reverse=reverse)
+
+        # Update header labels with a sort arrow on the active column
+        arrow = " ▼" if reverse else " ▲"
+        for c, label in self._history_col_labels.items():
+            if c == "no":
+                continue
+            text = label + (arrow if c == col else "")
+            self.history_tree.heading(c, text=text)
+
+        for iid in self.history_tree.get_children():
+            self.history_tree.delete(iid)
+        for row_num, entry in enumerate(rows, start=1):
+            tag = "evenrow" if row_num % 2 == 0 else "oddrow"
+            size_label = self._format_size(entry.get("size_bytes"))
+            self.history_tree.insert(
+                "", "end",
+                values=(row_num, entry.get("date"), entry.get("title"), size_label, entry.get("path")),
+                tags=(tag,)
+            )
 
     def _clear_history(self):
         """Delete history file and clear the Treeview."""
@@ -546,7 +612,7 @@ class YTDLPGui(tk.Tk):
             messagebox.showinfo("No selection", "প্রথমে একটি লিস্ট আইটেম সিলেক্ট করুন।")
             return
         item = self.history_tree.item(selected[0])
-        path = item["values"][2]
+        path = item["values"][4]
         self._open_file(path)
 
     def _on_history_open_folder(self):
@@ -555,7 +621,7 @@ class YTDLPGui(tk.Tk):
             messagebox.showinfo("No selection", "প্রথমে একটি লিস্ট আইটেম সিলেক্ট করুন।")
             return
         item = self.history_tree.item(selected[0])
-        path = item["values"][2]
+        path = item["values"][4]
         self._open_folder(os.path.dirname(path) if os.path.isfile(path) else path)
 
     def _get_delay_ms(self):
@@ -916,6 +982,28 @@ class YTDLPGui(tk.Tk):
                          relief="flat",
                          padding=(8, 6))
         style.map("Treeview.Heading",
+                  background=[("active", BG_CARD_ALT)])
+
+        # ------- History table (distinct style: real table look) -------
+        style.configure("History.Treeview",
+                         background=BG_INPUT,
+                         foreground=FG_TEXT,
+                         fieldbackground=BG_INPUT,
+                         borderwidth=1,
+                         relief="solid",
+                         rowheight=28,
+                         font=("Segoe UI", 10))
+        style.map("History.Treeview",
+                  background=[("selected", ACCENT)],
+                  foreground=[("selected", "#ffffff")])
+        style.configure("History.Treeview.Heading",
+                         background=BG_CARD_ALT,
+                         foreground=FG_TEXT,
+                         font=("Segoe UI Semibold", 9, "bold"),
+                         borderwidth=1,
+                         relief="solid",
+                         padding=(8, 7))
+        style.map("History.Treeview.Heading",
                   background=[("active", BG_CARD_ALT)])
 
     def _card(self, parent, title=None):
@@ -1333,28 +1421,47 @@ class YTDLPGui(tk.Tk):
         ttk.Button(btn_row, text="🗑 Clear History", style="Stop.TButton", command=self._clear_history).pack(side="left", padx=(10, 0))
 
         # History Treeview
-        tree_wrap = tk.Frame(hist_inner, bg=BG_INPUT, highlightbackground=BORDER, highlightthickness=1)
+        tree_wrap = tk.Frame(hist_inner, bg=BORDER, highlightbackground=BORDER, highlightthickness=1)
         tree_wrap.pack(fill="both", expand=True)
+        tree_wrap.grid_rowconfigure(0, weight=1)
+        tree_wrap.grid_columnconfigure(0, weight=1)
 
         self.history_tree = ttk.Treeview(
             tree_wrap,
-            columns=("date", "title", "path"),
+            columns=("no", "date", "title", "size", "path"),
             show="headings",
             height=20,
-            selectmode="browse"
+            selectmode="browse",
+            style="History.Treeview",
         )
-        self.history_tree.heading("date", text="Date")
-        self.history_tree.heading("title", text="Title")
-        self.history_tree.heading("path", text="Local Path")
+        self.history_tree.column("no", width=48, minwidth=40, anchor="center", stretch=False)
+        self.history_tree.column("date", width=140, minwidth=120, anchor="w", stretch=False)
+        self.history_tree.column("title", width=380, minwidth=200, anchor="w", stretch=True)
+        self.history_tree.column("size", width=90, minwidth=80, anchor="e", stretch=False)
+        self.history_tree.column("path", width=380, minwidth=200, anchor="w", stretch=True)
 
-        self.history_tree.column("date", width=140, anchor="w", stretch=False)
-        self.history_tree.column("title", width=300, anchor="w", stretch=True)
-        self.history_tree.column("path", width=300, anchor="w", stretch=True)
+        # IDM-style clickable/sortable column headers (▲/▼ arrow shows on
+        # the active sort column; clicking again flips the direction).
+        self._history_sort_col = "date"
+        self._history_sort_reverse = True  # newest first by default
+        self._history_col_labels = {
+            "no": "#", "date": "Date", "title": "Title", "size": "Size", "path": "Local Path"
+        }
+        for col in ("date", "title", "size", "path"):
+            self.history_tree.heading(col, text=self._history_col_labels[col],
+                                       command=lambda c=col: self._sort_history_by(c))
+        self.history_tree.heading("no", text="#")  # row number -- not sortable
+
+        # Zebra striping so rows read like a real table instead of a wall of text
+        self.history_tree.tag_configure("evenrow", background=BG_INPUT)
+        self.history_tree.tag_configure("oddrow", background=BG_CARD_ALT)
 
         h_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.history_tree.yview)
-        self.history_tree.configure(yscrollcommand=h_scroll.set)
-        self.history_tree.pack(side="left", fill="both", expand=True)
-        h_scroll.pack(side="right", fill="y")
+        hx_scroll = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.history_tree.xview)
+        self.history_tree.configure(yscrollcommand=h_scroll.set, xscrollcommand=hx_scroll.set)
+        self.history_tree.grid(row=0, column=0, sticky="nsew")
+        h_scroll.grid(row=0, column=1, sticky="ns")
+        hx_scroll.grid(row=1, column=0, sticky="ew")
 
         # Bottom buttons for selected item
         action_row = ttk.Frame(hist_inner, style="Card.TFrame")
